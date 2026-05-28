@@ -1,0 +1,35 @@
+{
+  "name": "blackwall-eliza-guardrail",
+  "version": "0.1.0",
+  "description": "BLACK_WALL pre-action guardrail for ElizaOS agents. Wraps every action handler with a forecast() check so STOP-rated actions abort before they run.",
+  "type": "module",
+  "main": "./src/index.mjs",
+  "exports": {
+    ".": "./src/index.mjs"
+  },
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "check": "node --check src/index.mjs"
+  },
+  "keywords": [
+    "elizaos",
+    "eliza-plugin",
+    "ai-agents",
+    "guardrails",
+    "ai-safety",
+    "blackwall"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "blackwall-mcp": "^1.1.0"
+  },
+  "peerDependencies": {
+    "@elizaos/core": ">=1.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

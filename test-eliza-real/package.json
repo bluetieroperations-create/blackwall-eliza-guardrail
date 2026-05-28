@@ -1,0 +1,10 @@
+{
+  "name": "blackwall-eliza-guardrail-realtest",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@elizaos/core": "latest",
+    "blackwall-eliza-guardrail": "file:.."
+  }
+}
