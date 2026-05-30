@@ -71,6 +71,31 @@ blackwallGuardrail({
 
 Fail-open: if BLACK_WALL is unreachable, the wrapper logs a warning and lets the action proceed. Network glitches at BLACK_WALL won't take down your agent.
 
+## Multi-step handlers — per-call gating with `gateCall()`
+
+The action wrap forecasts the action **as a whole**. That's the right default — but a `GO` on the action does **not** cover each tool call *inside* a multi-step handler. The dangerous case: call #1 lands an irreversible on-chain write before a constraint trips on call #2. For irreversible writes, you want a check **per call**.
+
+Eliza 1.7.x has no per-tool-call hook (see below), so per-call gating is **opt-in**: wrap each irreversible step inside your handler with `gateCall()`. It forecasts that step **threaded to the action's forecast id** — so every per-call check shares one chain — enforces `STOP` (in enforce mode), runs the step, and observes the outcome.
+
+```ts
+import { gateCall } from 'blackwall-eliza-guardrail';
+
+// inside a multi-step action handler:
+async function handler(runtime, message, state) {
+  // each irreversible step is checked individually, all linked to this action's chain
+  await gateCall('approve_erc20', { spender, token, amount_usd }, () => approve(spender, amount));
+  await gateCall('swap',          { pool, amount_usd },           () => swap(pool, amount));
+  return { ok: true };
+}
+```
+
+- Runs inside a wrapped action handler → inherits the parent forecast id + mode automatically (via `AsyncLocalStorage`; no plumbing).
+- Each `gateCall` forecast carries `parent_forecast_id`, so BLACK_WALL can reconstruct the whole chain and you can measure per-call STOP rates.
+- In `enforce` mode, a `STOP` on any step throws **before that step runs** — the prior steps already committed are visible in the chain.
+- Fail-open and observe semantics match the action wrap.
+
+Per-action forecasting stays the default; reach for `gateCall()` only where a handler is itself multi-step and the steps are irreversible.
+
 ## Why handler-wrap?
 
 The only events `@elizaos/core@1.7.x` emits around action execution are `ACTION_STARTED` / `ACTION_COMPLETED`. Listener errors on those are caught and logged by `executePlannedToolCall` — they don't abort the action. There is no pre-tool-call hook with abort semantics in the public surface today (earlier versions declared `HOOK_TOOL_BEFORE` in the enum, but it was never wired up; in 1.7.x it's gone entirely).

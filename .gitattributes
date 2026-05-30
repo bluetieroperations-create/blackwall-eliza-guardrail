@@ -1,0 +1,3 @@
+# Keep shell hooks LF-only so the shebang isn't broken by CRLF on clone (Linux/CI).
+.githooks/** text eol=lf
+*.sh text eol=lf

@@ -1,0 +1,29 @@
+title = "BlueTier / Black_Wall — gitleaks config"
+
+[extend]
+useDefault = true
+
+# Real threat: live Black_Wall API keys. (Test/doc keys bw_test_key / bw_live_xxx ignored.)
+[[rules]]
+id = "blackwall-live-key"
+description = "Black_Wall live API key (bw_live_ + 32 hex)"
+regex = '''bw_live_[0-9a-f]{32}'''
+keywords = ["bw_live_"]
+
+  [rules.allowlist]
+  description = "documentation/test placeholders, not real keys"
+  regexes = ['''bw_live_(YOUR|xxx|x{3,}|\.\.\.|<)''']
+
+# Supabase access / personal token (sbp_) — defense-in-depth parity.
+[[rules]]
+id = "supabase-access-token"
+description = "Supabase access/personal token (sbp_)"
+regex = '''sbp_[a-z0-9]{40}'''
+keywords = ["sbp_"]
+
+[allowlist]
+description = "known non-secrets in this repo"
+regexes = [
+  '''bw_live_(YOUR|xxx|x{3,}|\.\.\.|<)''',
+  '''bw_test_key''',
+]

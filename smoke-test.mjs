@@ -3,7 +3,7 @@
 // Exercises: observe-mode pass-through, enforce-mode STOP throw, fail-open on
 // forecast network error, missing handler skip.
 
-import { blackwallGuardrail } from './src/index.mjs';
+import { blackwallGuardrail, gateCall } from './src/index.mjs';
 
 let fetchCalls = [];
 let nextResponses = [];
@@ -189,6 +189,77 @@ console.log('\n[7] plugin shape matches Eliza Plugin contract');
   assert(plugin.name === 'blackwall-guardrail', 'has name');
   assert(typeof plugin.init === 'function', 'has init function');
   assert(typeof plugin.description === 'string', 'has description');
+}
+
+// -----------------------------------------------------------------------
+console.log('\n[8] gateCall inside a wrapped handler threads parent_forecast_id to the action');
+{
+  await reset();
+  let stepRan = false;
+  const action = makeAction('rebalance', async () => {
+    await gateCall('transfer', { to: '0xabc', amount_usd: 100 }, async () => { stepRan = true; return 'sent'; });
+    return { done: true };
+  });
+  const runtime = makeRuntime([action]);
+  const plugin = blackwallGuardrail({ apiKey: 'bw_test_key', mode: 'observe' });
+  await plugin.init(runtime);
+
+  nextResponses.push({ body: { id: 'fc_action', recommendation: 'GO', risk_score: 5 } }); // action forecast
+  nextResponses.push({ body: { id: 'fc_call', recommendation: 'GO', risk_score: 5 } });   // per-call forecast
+  nextResponses.push({ body: { ok: true } }); // observe (call)
+  nextResponses.push({ body: { ok: true } }); // observe (action)
+
+  const result = await action.handler(runtime, { content: { text: 'rebalance' } }, {}, {});
+  await new Promise((r) => setTimeout(r, 10));
+
+  assert(stepRan === true, 'guarded step ran');
+  assert(result?.done === true, 'handler returned');
+  assert(fetchCalls[0]?.body?.action === 'rebalance', 'first forecast is the action');
+  assert(fetchCalls[0]?.body?.parent_forecast_id === undefined, 'action forecast has NO parent');
+  assert(fetchCalls[1]?.body?.action === 'transfer', 'second forecast is the per-call');
+  assert(fetchCalls[1]?.body?.parent_forecast_id === 'fc_action', 'per-call THREADED to the action forecast id');
+}
+
+// -----------------------------------------------------------------------
+console.log('\n[9] enforce mode — gateCall STOP aborts the guarded step');
+{
+  await reset();
+  let stepRan = false;
+  const action = makeAction('rebalance', async () => {
+    await gateCall('transfer', { amount_usd: 1e9 }, async () => { stepRan = true; });
+    return { done: true };
+  });
+  const runtime = makeRuntime([action]);
+  const plugin = blackwallGuardrail({ apiKey: 'bw_test_key', mode: 'enforce' });
+  await plugin.init(runtime);
+
+  nextResponses.push({ body: { id: 'fc_action', recommendation: 'GO', risk_score: 10 } }); // action OK
+  nextResponses.push({ body: { id: 'fc_call', recommendation: 'STOP', risk_score: 98, red_flags: [{ code: 'DAILY_CAP_EXCEEDED' }] } }); // per-call STOP
+  nextResponses.push({ body: { ok: true } }); // observe(aborted) for the call
+  nextResponses.push({ body: { ok: true } }); // observe(diverged) for the action
+
+  let threw = false;
+  try { await action.handler(runtime, { content: { text: 'rebalance' } }, {}, {}); }
+  catch { threw = true; }
+  await new Promise((r) => setTimeout(r, 10));
+
+  assert(threw === true, 'enforce STOP on a per-call aborts the handler');
+  assert(stepRan === false, 'blocked step never ran');
+}
+
+// -----------------------------------------------------------------------
+console.log('\n[10] gateCall outside a wrapped handler still gates (no parent)');
+{
+  await reset();
+  let ran = false;
+  nextResponses.push({ body: { id: 'fc_solo', recommendation: 'GO', risk_score: 5 } });
+  nextResponses.push({ body: { ok: true } });
+  const r = await gateCall('solo_call', { x: 1 }, async () => { ran = true; return 'ok'; }, { apiKey: 'bw_test_key' });
+  await new Promise((res) => setTimeout(res, 10));
+  assert(ran === true, 'guarded step ran');
+  assert(r === 'ok', 'gateCall returned the step result');
+  assert(fetchCalls[0]?.body?.action === 'solo_call', 'forecast got the call action');
+  assert(!('parent_forecast_id' in (fetchCalls[0]?.body ?? {})), 'no parent_forecast_id outside a handler');
 }
 
 console.log('\nAll smoke tests passed.\n');

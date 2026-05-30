@@ -1,0 +1,30 @@
+#!/bin/sh
+# Pre-commit secret scan — blocks commits that contain secrets.
+# Enabled via:  git config core.hooksPath .githooks  (auto-set on `npm install`).
+# FAILS CLOSED: if the scanner is missing or errors, the commit is blocked.
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+  echo "----------------------------------------------------------------" >&2
+  echo "X COMMIT BLOCKED: gitleaks is not installed (fail-closed)."        >&2
+  echo "  Install:  winget install --id Gitleaks.Gitleaks -e"             >&2
+  echo "            (or: brew install gitleaks)"                          >&2
+  echo "  Override (discouraged):  git commit --no-verify"               >&2
+  echo "----------------------------------------------------------------" >&2
+  exit 1
+fi
+
+gitleaks git --staged --redact --no-banner --config .gitleaks.toml
+code=$?
+
+if [ "$code" -ne 0 ]; then
+  echo ""                                                                 >&2
+  echo "----------------------------------------------------------------" >&2
+  echo "X COMMIT BLOCKED: a secret was detected in staged changes."       >&2
+  echo "  - Real secret?  Remove it; never commit keys."                  >&2
+  echo "  - False positive?  Add an allowlist entry to .gitleaks.toml."   >&2
+  echo "  Override (discouraged):  git commit --no-verify"               >&2
+  echo "----------------------------------------------------------------" >&2
+  exit 1
+fi
+
+exit 0

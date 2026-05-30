@@ -19,7 +19,13 @@
  * plugins contributed.
  */
 
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { forecast, observe } from 'blackwall-mcp/lib';
+
+// Threads the current action's forecast id into its running handler so gateCall()
+// can link each per-call forecast to one chain (the partial-execution fix). ALS
+// keeps concurrent actions isolated — no runtime mutation, no cross-action bleed.
+const actionForecastContext = new AsyncLocalStorage();
 
 // Cap how big a parameter blob we ship to forecast(). Large prompts / file
 // payloads can balloon a single observe call; the verdict only needs enough
@@ -130,6 +136,89 @@ function emit(onEvent, event) {
 }
 
 /**
+ * Per-call gate for MULTI-STEP handlers (the partial-execution fix).
+ *
+ * A GO on the action as a whole does NOT cover each tool call inside the handler:
+ * call #1 can land an irreversible on-chain write before a constraint trips on
+ * call #2. Eliza 1.7.x has no per-tool-call hook (handler-wrap is the only abort
+ * surface), so per-call gating must be opt-in: wrap each irreversible step inside
+ * your handler with gateCall(). It forecasts that step THREADED to the action's
+ * forecast id (so all per-call checks share one chain), enforces STOP in enforce
+ * mode, runs the step, and observes the outcome.
+ *
+ *   import { gateCall } from 'blackwall-eliza-guardrail';
+ *   // inside a multi-step action handler:
+ *   await gateCall('approve_erc20', { spender, amount_usd }, () => approve(...));
+ *   await gateCall('swap',          { pool, amount_usd },    () => swap(...));
+ *
+ * Must run inside a wrapped action handler to inherit the parent id + mode from
+ * AsyncLocalStorage. Called outside one, it still gates (forecasts with no parent,
+ * env-resolved config) so it's safe to use defensively.
+ *
+ * @template T
+ * @param {string} action
+ * @param {Record<string, any>} inputs
+ * @param {() => Promise<T> | T} run   the actual irreversible call
+ * @param {{ context?: Record<string, any>, apiKey?: string, baseUrl?: string }} [opts]
+ * @returns {Promise<T>}
+ * @throws when enforce mode + STOP — the step does NOT run.
+ */
+export async function gateCall(action, inputs, run, opts = {}) {
+  if (typeof run !== 'function') {
+    throw new TypeError('gateCall(action, inputs, run): `run` must be a function (the step to guard).');
+  }
+  const store = actionForecastContext.getStore();
+  const cfg = store?.cfg ?? resolveConfig(opts);
+  const parent_forecast_id = store?.parentForecastId;
+
+  let verdict;
+  try {
+    verdict = await forecast(
+      {
+        action,
+        inputs: truncateInputs(inputs ?? {}, cfg.maxInputBytes),
+        context: opts.context,
+        parent_forecast_id, // thread this per-call check to the action's chain
+      },
+      { apiKey: cfg.apiKey, baseUrl: cfg.baseUrl }
+    );
+  } catch (err) {
+    // Fail-open, same doctrine as the action wrap: a BLACK_WALL outage must never
+    // break the agent. Run the step ungated.
+    emit(cfg.onEvent, { type: 'forecast_error', actionName: action, error: err });
+    return run();
+  }
+
+  const reportedVia = 'eliza_guardrail';
+  if (cfg.mode === 'enforce' && verdict?.recommendation === 'STOP') {
+    emit(cfg.onEvent, { type: 'stop', actionName: action, forecastId: verdict?.id, recommendation: 'STOP' });
+    if (verdict?.id) {
+      observe(verdict.id, { outcome_class: 'aborted', divergence_severity: 'none', details: 'blocked by enforce-mode gateCall' },
+        { apiKey: cfg.apiKey, baseUrl: cfg.baseUrl, reportedVia }).catch(() => {});
+    }
+    const flagCodes = Array.isArray(verdict?.red_flags)
+      ? verdict.red_flags.map((f) => f?.code).filter(Boolean).join(', ')
+      : '';
+    throw new Error(`BLACK_WALL blocked call "${action}": STOP${flagCodes ? ` (${flagCodes})` : ''}`);
+  }
+
+  try {
+    const result = await run();
+    if (verdict?.id) {
+      observe(verdict.id, { outcome_class: 'matched' },
+        { apiKey: cfg.apiKey, baseUrl: cfg.baseUrl, reportedVia }).catch(() => {});
+    }
+    return result;
+  } catch (err) {
+    if (verdict?.id) {
+      observe(verdict.id, { outcome_class: 'diverged', divergence_severity: 'medium', details: String(err?.message ?? err).slice(0, 500) },
+        { apiKey: cfg.apiKey, baseUrl: cfg.baseUrl, reportedVia }).catch(() => {});
+    }
+    throw err;
+  }
+}
+
+/**
  * Wrap a single action's `.handler` with a forecast/observe envelope.
  * Returns the patched action object (mutated in place; returned for clarity).
  */
@@ -200,8 +289,13 @@ function wrapActionHandler(action, cfg, logger) {
     let outcome = 'matched';
     let observeDetails;
     let actionError;
+    // Run the original handler inside the ALS context carrying THIS action's
+    // forecast id, so any gateCall() the handler makes threads to this parent.
+    const callStore = { parentForecastId: verdict?.id, cfg };
     try {
-      const result = await original.call(this, runtime, message, state, opts, callback, responses);
+      const result = await actionForecastContext.run(callStore, () =>
+        original.call(this, runtime, message, state, opts, callback, responses)
+      );
       if (verdict?.id) {
         observe(
           verdict.id,
