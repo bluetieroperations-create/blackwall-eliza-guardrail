@@ -42,7 +42,8 @@ const DEFAULT_MAX_INPUT_BYTES = 8 * 1024;
  * @property {string} [baseUrl]     Defaults to env BLACKWALL_BASE_URL or https://blackwalltier.com.
  * @property {GuardrailMode} [mode] 'observe' (default — log only, never abort) or 'enforce' (throw on STOP).
  * @property {(actionName: string) => boolean} [shouldGate] Per-action opt-out. Return false to skip wrapping.
- * @property {number} [maxInputBytes] Truncate forecast() inputs payload over this size. Default 8KB.
+ * @property {number} [maxInputBytes] Hard cap on the forecast() inputs payload size. Default 8KB.
+ * @property {boolean} [sendUserIntent] Send the raw inbound user message as context.user_intent. Default true; set false (or BLACKWALL_SEND_USER_INTENT=false) to keep user message text on-box.
  * @property {(event: GuardrailEvent) => void} [onEvent] Telemetry hook (logged on STOP, error, observe failure, etc.).
  */
 
@@ -70,6 +71,14 @@ function resolveConfig(config = {}) {
     mode: mode === 'enforce' ? 'enforce' : 'observe',
     shouldGate: typeof config.shouldGate === 'function' ? config.shouldGate : () => true,
     maxInputBytes: typeof config.maxInputBytes === 'number' ? config.maxInputBytes : DEFAULT_MAX_INPUT_BYTES,
+    // Egress consent (audit M-1): the wrapper sends the raw inbound user message as
+    // `context.user_intent` so forecast() can reason about intent. Operators who do
+    // not want user message text leaving the box can opt out (config or
+    // BLACKWALL_SEND_USER_INTENT=false). Defaults to true (current behavior).
+    sendUserIntent:
+      config.sendUserIntent !== undefined
+        ? config.sendUserIntent !== false
+        : process.env.BLACKWALL_SEND_USER_INTENT !== 'false',
     onEvent: typeof config.onEvent === 'function' ? config.onEvent : null,
   };
 }
@@ -123,7 +132,41 @@ function truncateInputs(inputs, maxBytes) {
   }
   trimmed._truncated = true;
   trimmed._original_bytes = serialized.length;
+
+  // HARD CAP (audit L-1): per-string trimming alone does NOT bound a WIDE object
+  // (many short-valued keys) or a non-string-heavy payload — such a payload stays
+  // over `maxBytes` and would ship unbounded to forecast(). If the trimmed form is
+  // still over the cap, return a compact SHAPE summary instead so the bytes that
+  // leave the box are always bounded regardless of input width.
+  let trimmedSize;
+  try {
+    trimmedSize = JSON.stringify(trimmed).length;
+  } catch {
+    trimmedSize = Infinity;
+  }
+  if (trimmedSize > maxBytes) {
+    return {
+      _truncated: true,
+      _reason: 'oversize',
+      _original_bytes: serialized.length,
+      _keys: Object.keys(inputs).length,
+      _sample_keys: Object.keys(inputs).slice(0, 20),
+    };
+  }
   return trimmed;
+}
+
+/**
+ * Normalize a verdict's recommendation to a canonical upper-case token before
+ * comparison. The BLACK_WALL API contract does not guarantee exact casing or the
+ * absence of surrounding whitespace (the sibling `blackwall-mcp/lib/gate.mjs`
+ * already .toUpperCase()s it everywhere). Comparing the raw field with
+ * `=== 'STOP'` would let a non-canonical "stop" / " STOP " silently BYPASS
+ * enforce mode and run a STOP-rated action — defeating the entire control.
+ */
+function isStop(verdict) {
+  const rec = verdict?.recommendation;
+  return typeof rec === 'string' && rec.trim().toUpperCase() === 'STOP';
 }
 
 function emit(onEvent, event) {
@@ -190,7 +233,7 @@ export async function gateCall(action, inputs, run, opts = {}) {
   }
 
   const reportedVia = 'eliza_guardrail';
-  if (cfg.mode === 'enforce' && verdict?.recommendation === 'STOP') {
+  if (cfg.mode === 'enforce' && isStop(verdict)) {
     emit(cfg.onEvent, { type: 'stop', actionName: action, forecastId: verdict?.id, recommendation: 'STOP' });
     if (verdict?.id) {
       observe(verdict.id, { outcome_class: 'aborted', divergence_severity: 'none', details: 'blocked by enforce-mode gateCall' },
@@ -237,7 +280,7 @@ function wrapActionHandler(action, cfg, logger) {
     const inputs = truncateInputs(extractActionInputs(action.name, message, opts), cfg.maxInputBytes);
     const context = {
       ...(runtime?.character?.name ? { agent_role: runtime.character.name } : {}),
-      ...(message?.content?.text ? { user_intent: message.content.text } : {}),
+      ...(cfg.sendUserIntent && message?.content?.text ? { user_intent: message.content.text } : {}),
       source: 'elizaos',
     };
 
@@ -256,7 +299,7 @@ function wrapActionHandler(action, cfg, logger) {
       return original.call(this, runtime, message, state, opts, callback, responses);
     }
 
-    if (cfg.mode === 'enforce' && verdict?.recommendation === 'STOP') {
+    if (cfg.mode === 'enforce' && isStop(verdict)) {
       emit(cfg.onEvent, {
         type: 'stop',
         actionName: action.name,

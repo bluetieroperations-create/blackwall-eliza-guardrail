@@ -53,7 +53,8 @@ blackwallGuardrail({
   baseUrl: 'https://blackwalltier.com',   // override for self-hosted / staging
   mode: 'enforce',                        // 'observe' | 'enforce'
   shouldGate: (actionName) => actionName !== 'IGNORE',  // per-action opt-out
-  maxInputBytes: 8 * 1024,                // cap forecast payload size
+  maxInputBytes: 8 * 1024,                // hard cap on the forecast payload size
+  sendUserIntent: false,                  // do NOT send the user's message text (see Data & privacy)
   onEvent: (event) => myTelemetry(event), // optional telemetry hook
 });
 ```
@@ -70,6 +71,24 @@ blackwallGuardrail({
 4. After the action runs (or after a STOP), the wrapper calls `/api/v1/forecast/:id/outcome` so BLACK_WALL can learn from real-world divergence.
 
 Fail-open: if BLACK_WALL is unreachable, the wrapper logs a warning and lets the action proceed. Network glitches at BLACK_WALL won't take down your agent.
+
+## Data & privacy
+
+The guardrail sends data to the BLACK_WALL API (`baseUrl`, default `https://blackwalltier.com`) on **every gated action** so it can score risk. Be aware of exactly what leaves your machine:
+
+| Field | Contents | Sent by default |
+|---|---|---|
+| `action` | The action name (e.g. `send_email`) | yes |
+| `inputs` | The action's parameters, truncated to `maxInputBytes` (default 8 KB) — may include recipients, amounts, addresses, etc. | yes |
+| `context.agent_role` | Your character's `name` | yes |
+| `context.user_intent` | **The raw inbound user message text** | yes — set `sendUserIntent: false` (or `BLACKWALL_SEND_USER_INTENT=false`) to omit |
+
+If your agent handles sensitive or regulated content, review this before enabling `enforce` (or `observe`) in production:
+
+- **`sendUserIntent: false`** stops the raw user message from being transmitted; the gate still scores the action + inputs.
+- **`maxInputBytes`** is a *hard* cap — payloads over it (including wide objects) are replaced with a compact shape summary, never shipped whole.
+- **`shouldGate`** lets you exclude specific actions from gating (and therefore from any transmission) entirely.
+- Point **`baseUrl`** at a self-hosted BLACK_WALL deployment if you don't want data going to the hosted service.
 
 ## Multi-step handlers — per-call gating with `gateCall()`
 

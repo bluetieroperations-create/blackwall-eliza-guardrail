@@ -1,11 +1,19 @@
 {
   "name": "blackwall-eliza-guardrail",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "BLACK_WALL pre-action guardrail for ElizaOS agents. Wraps every action handler with a forecast() check so STOP-rated actions abort before they run; gateCall() adds per-call gating for multi-step handlers.",
   "type": "module",
   "main": "./src/index.mjs",
   "exports": {
     ".": "./src/index.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bluetieroperations-create/blackwall-eliza-guardrail.git"
+  },
+  "homepage": "https://github.com/bluetieroperations-create/blackwall-eliza-guardrail#readme",
+  "bugs": {
+    "url": "https://github.com/bluetieroperations-create/blackwall-eliza-guardrail/issues"
   },
   "files": [
     "src",

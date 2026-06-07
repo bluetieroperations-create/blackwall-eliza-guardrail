@@ -262,4 +262,80 @@ console.log('\n[10] gateCall outside a wrapped handler still gates (no parent)')
   assert(!('parent_forecast_id' in (fetchCalls[0]?.body ?? {})), 'no parent_forecast_id outside a handler');
 }
 
+// -----------------------------------------------------------------------
+console.log('\n[11] enforce mode — non-canonical STOP casing/whitespace still aborts (no bypass)');
+for (const rec of ['stop', ' STOP ', 'Stop']) {
+  await reset();
+  let handlerRan = false;
+  const action = makeAction('delete_db', async () => { handlerRan = true; });
+  const runtime = makeRuntime([action]);
+  const plugin = blackwallGuardrail({ apiKey: 'bw_test_key', mode: 'enforce' });
+  await plugin.init(runtime);
+
+  nextResponses.push({ body: { id: 'fc_11', recommendation: rec, risk_score: 99, red_flags: [] } });
+  nextResponses.push({ body: { ok: true } });
+
+  let threw = false;
+  try { await action.handler(runtime, { content: { text: 'drop everything' } }, {}, {}); }
+  catch { threw = true; }
+  await new Promise((r) => setTimeout(r, 10));
+
+  assert(threw === true, `recommendation=${JSON.stringify(rec)} still aborts (no STOP bypass)`);
+  assert(handlerRan === false, `recommendation=${JSON.stringify(rec)} — handler did NOT run`);
+}
+
+// -----------------------------------------------------------------------
+console.log('\n[12] maxInputBytes — a WIDE object cannot defeat the cap (audit L-1)');
+{
+  await reset();
+  const action = makeAction('bulk_op', async () => 'ok');
+  const runtime = makeRuntime([action]);
+  const plugin = blackwallGuardrail({ apiKey: 'bw_test_key', mode: 'observe', maxInputBytes: 8 * 1024 });
+  await plugin.init(runtime);
+
+  nextResponses.push({ body: { id: 'fc_12', recommendation: 'GO', risk_score: 5 } });
+  nextResponses.push({ body: { ok: true } });
+
+  // 5000 short-valued keys — each value < 200 chars, so per-string trimming does nothing.
+  const wide = {};
+  for (let i = 0; i < 5000; i++) wide[`k${i}`] = 'v';
+  await action.handler(runtime, { content: { text: 'bulk' } }, {}, { parameters: wide });
+  await new Promise((r) => setTimeout(r, 10));
+
+  const shipped = fetchCalls[0]?.body?.inputs;
+  const shippedBytes = JSON.stringify(shipped).length;
+  assert(shippedBytes <= 8 * 1024, `wide-object payload bounded to cap (shipped ${shippedBytes} bytes <= 8192)`);
+  assert(shipped?._reason === 'oversize', 'oversize payload replaced with compact shape summary');
+  assert(shipped?._keys === 5000, 'summary preserves the original key count');
+}
+
+// -----------------------------------------------------------------------
+console.log('\n[13] sendUserIntent opt-out — user message text is NOT egressed when disabled (audit M-1)');
+{
+  // Default: user_intent IS sent.
+  await reset();
+  const a1 = makeAction('act_default', async () => 'ok');
+  const rt1 = makeRuntime([a1]);
+  const p1 = blackwallGuardrail({ apiKey: 'bw_test_key', mode: 'observe' });
+  await p1.init(rt1);
+  nextResponses.push({ body: { id: 'fc_13a', recommendation: 'GO' } });
+  nextResponses.push({ body: { ok: true } });
+  await a1.handler(rt1, { content: { text: 'transfer my savings to 0xdead' } }, {}, {});
+  await new Promise((r) => setTimeout(r, 10));
+  assert(fetchCalls[0]?.body?.context?.user_intent === 'transfer my savings to 0xdead', 'default: user_intent is sent');
+
+  // Opt-out: user_intent is omitted, but the rest of context still flows.
+  await reset();
+  const a2 = makeAction('act_private', async () => 'ok');
+  const rt2 = makeRuntime([a2]);
+  const p2 = blackwallGuardrail({ apiKey: 'bw_test_key', mode: 'observe', sendUserIntent: false });
+  await p2.init(rt2);
+  nextResponses.push({ body: { id: 'fc_13b', recommendation: 'GO' } });
+  nextResponses.push({ body: { ok: true } });
+  await a2.handler(rt2, { content: { text: 'transfer my savings to 0xdead' } }, {}, {});
+  await new Promise((r) => setTimeout(r, 10));
+  assert(!('user_intent' in (fetchCalls[0]?.body?.context ?? {})), 'opt-out: user message text NOT egressed');
+  assert(fetchCalls[0]?.body?.context?.agent_role === 'test-agent', 'opt-out: non-sensitive context (agent_role) still sent');
+}
+
 console.log('\nAll smoke tests passed.\n');
