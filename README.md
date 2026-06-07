@@ -123,6 +123,17 @@ Wrapping `runtime.actions[*].handler` at init time is the only path that actuall
 
 If upstream adds a pre-action hook with proper abort semantics in a future release, this plugin will migrate to it and the load-order caveat goes away.
 
+## Design partners wanted
+
+Building an ElizaOS agent that takes **real irreversible actions** (on-chain transactions, payments, destructive tool calls)? I'm onboarding a handful of **design partners**:
+
+- **You get:** free Black_Wall access + hands-on integration support, and signed, verifiable decision receipts.
+- **You give:** run the gate in `observe` mode (it never blocks your agent) and flag, on a sample of actions, whether a decision was right or wrong. That feedback is what makes the gate learn your real risk surface.
+
+Nothing custodial — no funds, keys, or private data leave your side. ~10 minutes a week.
+
+**→ Interested?** [Open an issue](https://github.com/bluetieroperations-create/blackwall-eliza-guardrail/issues/new) or reach out via [blackwalltier.com](https://blackwalltier.com).
+
 ## License
 
 MIT
