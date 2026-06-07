@@ -132,7 +132,7 @@ Building an ElizaOS agent that takes **real irreversible actions** (on-chain tra
 
 Nothing custodial — no funds, keys, or private data leave your side. ~10 minutes a week.
 
-**→ Interested?** [Open an issue](https://github.com/bluetieroperations-create/blackwall-eliza-guardrail/issues/new) or reach out via [blackwalltier.com](https://blackwalltier.com).
+**→ Apply as a design partner** (2-min form): https://docs.google.com/forms/d/e/1FAIpQLScw4TxRhMn-qrg91jDyvP0U2-yzcEmKxdwqINbNhoka4hUkXA/viewform — or [open an issue](https://github.com/bluetieroperations-create/blackwall-eliza-guardrail/issues/new).
 
 ## License
 
