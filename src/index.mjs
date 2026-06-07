@@ -145,13 +145,29 @@ function truncateInputs(inputs, maxBytes) {
     trimmedSize = Infinity;
   }
   if (trimmedSize > maxBytes) {
-    return {
+    // The summary must itself be BOUNDED, or the "hard cap" is a lie: sample key
+    // *names* are caller-controlled and can each be arbitrarily long, so 20 of them
+    // shipped verbatim can dwarf maxBytes (a wide object of long keys defeats the
+    // cap exactly the way a wide object of short keys was supposed to be blocked).
+    // Bound each sampled key name in length, then bound the count to whatever still
+    // fits under the cap — dropping _sample_keys entirely if even one won't fit.
+    const summary = {
       _truncated: true,
       _reason: 'oversize',
       _original_bytes: serialized.length,
       _keys: Object.keys(inputs).length,
-      _sample_keys: Object.keys(inputs).slice(0, 20),
     };
+    const KEY_MAX = 64;
+    const boundedKeys = Object.keys(inputs)
+      .slice(0, 20)
+      .map((k) => (k.length > KEY_MAX ? `${k.slice(0, KEY_MAX)}…` : k));
+    // Fit as many sample keys as the remaining cap budget allows; if none fit,
+    // omit _sample_keys so the summary can never exceed maxBytes.
+    for (let n = boundedKeys.length; n >= 0; n--) {
+      const candidate = n > 0 ? { ...summary, _sample_keys: boundedKeys.slice(0, n) } : summary;
+      if (JSON.stringify(candidate).length <= maxBytes) return candidate;
+    }
+    return summary;
   }
   return trimmed;
 }

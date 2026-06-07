@@ -338,4 +338,34 @@ console.log('\n[13] sendUserIntent opt-out — user message text is NOT egressed
   assert(fetchCalls[0]?.body?.context?.agent_role === 'test-agent', 'opt-out: non-sensitive context (agent_role) still sent');
 }
 
+// -----------------------------------------------------------------------
+console.log('\n[14] maxInputBytes — a wide object of LONG KEY NAMES cannot defeat the cap (audit L-1 hardening)');
+{
+  await reset();
+  const action = makeAction('bulk_op_longkeys', async () => 'ok');
+  const runtime = makeRuntime([action]);
+  const plugin = blackwallGuardrail({ apiKey: 'bw_test_key', mode: 'observe', maxInputBytes: 8 * 1024 });
+  await plugin.init(runtime);
+
+  nextResponses.push({ body: { id: 'fc_14', recommendation: 'GO', risk_score: 5 } });
+  nextResponses.push({ body: { ok: true } });
+
+  // Key NAMES are caller-controlled and unbounded; the oversize summary used to
+  // ship up to 20 of them verbatim, so long key names blew past the "hard" cap
+  // (~1 MB shipped for 50k-char keys). The summary must stay bounded regardless.
+  const wide = {};
+  const bigName = 'x'.repeat(50000);
+  for (let i = 0; i < 5000; i++) wide[bigName + i] = 'v';
+  await action.handler(runtime, { content: { text: 'bulk' } }, {}, { parameters: wide });
+  await new Promise((r) => setTimeout(r, 10));
+
+  const shipped = fetchCalls[0]?.body?.inputs;
+  const shippedBytes = JSON.stringify(shipped).length;
+  assert(shippedBytes <= 8 * 1024, `long-key-name payload bounded to cap (shipped ${shippedBytes} bytes <= 8192)`);
+  assert(shipped?._reason === 'oversize', 'long-key oversize payload replaced with compact summary');
+  assert(shipped?._keys === 5000, 'summary preserves the original key count');
+  const maxSampleLen = Math.max(0, ...(shipped?._sample_keys ?? []).map((k) => k.length));
+  assert(maxSampleLen <= 65, `each sample key name is length-bounded (longest ${maxSampleLen} <= 65)`);
+}
+
 console.log('\nAll smoke tests passed.\n');
