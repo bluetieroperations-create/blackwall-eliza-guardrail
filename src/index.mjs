@@ -265,9 +265,13 @@ function hasHardBlocks(verdict) {
  */
 function hasConfirmationHandle(verdict) {
   const c = verdict?.confirmation;
-  if (!c || typeof c !== 'object') return false;
-  // An object (even {}) or one with an id is a confirmation requirement.
-  return true;
+  // Any PRESENT, non-null confirmation that is not a bare string is a
+  // requirement: object (incl. {} / array / null-proto), or a function. We
+  // exclude only nullish and string (a string is not a usable handle, and the
+  // server never emits one). Keying off `typeof === 'object'` alone would let a
+  // function-shaped confirmation slip through to the ungated run path; over JSON
+  // that shape can't arrive, but this is the strictly fail-closed predicate.
+  return c != null && typeof c !== 'string';
 }
 
 /**

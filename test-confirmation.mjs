@@ -396,6 +396,49 @@ await runTest('[F1b] enforce + confirmation present + poll_url EMPTY STRING → 
 });
 
 // ===========================================================================
+await runTest('[F1d] enforce + confirmation present but NON-OBJECT shape (function / array) → handler NOT run (fail closed)', async () => {
+// NOTE non-vacuity / MUTATION (audit L-1): a `confirmation` that is a function
+// returns typeof 'function', not 'object'. If hasConfirmationHandle keyed off
+// `typeof === 'object'` it would MISS a function confirmation ⇒ fall through to
+// the CAUTION run path ⇒ handler runs UNGATED. The presence-based predicate
+// (c != null && typeof c !== 'string') treats any present non-string handle as a
+// requirement, so both function- and array-shaped confirmations fail closed.
+// (Over JSON these shapes can't arrive; this pins the strictly-fail-closed
+// predicate so a future refactor to `typeof === 'object'` is caught.)
+  // function-shaped confirmation
+  reset();
+  let ranFn = false;
+  const actionFn = makeAction('send_money', async () => { ranFn = true; return 'SENT'; });
+  const runtimeFn = makeRuntime([actionFn]);
+  const pluginFn = blackwallGuardrail({ apiKey: 'bw_k', mode: 'enforce' });
+  await pluginFn.init(runtimeFn);
+  const fnVerdict = confirmationVerdict();
+  fnVerdict.confirmation = () => {}; // function, not object
+  forecastResponses.push({ body: fnVerdict });
+  let threwFn = null;
+  try { await actionFn.handler(runtimeFn, { content: { text: 'pay' } }, {}, {}); }
+  catch (e) { threwFn = e; }
+  await new Promise((r) => setTimeout(r, 10));
+  assert(ranFn === false, 'function-shaped confirmation: handler did NOT run (fail closed)');
+  assert(threwFn !== null && /no pollable approval URL/i.test(threwFn?.message), 'function-shaped: threw no-pollable-URL fail-closed error');
+
+  // array-shaped confirmation (typeof 'object', no poll_url) — also fail closed
+  reset();
+  let ranArr = false;
+  const actionArr = makeAction('send_money', async () => { ranArr = true; return 'SENT'; });
+  const runtimeArr = makeRuntime([actionArr]);
+  const pluginArr = blackwallGuardrail({ apiKey: 'bw_k', mode: 'enforce' });
+  await pluginArr.init(runtimeArr);
+  forecastResponses.push({ body: confirmationVerdict({ confirmation: [] }) });
+  let threwArr = null;
+  try { await actionArr.handler(runtimeArr, { content: { text: 'pay' } }, {}, {}); }
+  catch (e) { threwArr = e; }
+  await new Promise((r) => setTimeout(r, 10));
+  assert(ranArr === false, 'array-shaped confirmation: handler did NOT run (fail closed)');
+  assert(threwArr !== null && /no pollable approval URL/i.test(threwArr?.message), 'array-shaped: threw no-pollable-URL fail-closed error');
+});
+
+// ===========================================================================
 await runTest('[F1c] observe + confirmation present + poll_url MISSING → handler RAN (observe contract unchanged)', async () => {
 // NOTE non-vacuity: observe must NEVER alter behavior even on a malformed handle.
 // The FIX-1 fail-closed branch is gated behind enforce; in observe the action
@@ -790,8 +833,12 @@ await runTest('[14] audit L-2: apiKey is NOT sent to an OFF-ORIGIN poll_url; act
   let threw = null;
   try { await action.handler(runtime, { content: { text: 'pay' } }, {}, {}); } catch (e) { threw = e; }
   const pollCall = fetchCalls.find((c) => c.url.includes('evil.attacker.example'));
-  assert(pollCall === undefined, 'off-origin poll_url was NEVER polled (not pollable, fail closed)');
+  // SAFETY-CRITICAL canary FIRST (audit L-2): the single property that matters is
+  // that the action did NOT execute. Assert it before the "never polled" / no-auth
+  // proxies so a same-origin-check regression trips on handler-did-not-run, not on
+  // a secondary assertion.
   assert(handlerRan === false, 'off-origin confirmation: handler did NOT run (fail closed)');
+  assert(pollCall === undefined, 'off-origin poll_url was NEVER polled (not pollable, fail closed)');
   assert(threw !== null && /no pollable approval URL/i.test(threw?.message), 'off-origin: threw no-pollable-URL fail-closed error');
 
   // And the same-origin case still DOES carry the credential (no over-correction).
