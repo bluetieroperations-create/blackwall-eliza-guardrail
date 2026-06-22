@@ -514,5 +514,92 @@ console.log('\n[12] poll sends Authorization: Bearer <apiKey>');
 }
 
 // ===========================================================================
+console.log('\n[13] audit M-2: env confirmationWaitMs="Infinity" must NOT spin forever (budget clamped)');
+// NOTE non-vacuity: pre-fix deadline = now + Infinity, so `remaining` is always
+// Infinity > 0 and the loop polls every confirmationPollMs forever. The clamp makes
+// the budget finite; with a huge pollMs the single sleep spans the whole (clamped)
+// budget so the loop polls exactly once then aborts pending.
+{
+  reset();
+  const prevEnv = process.env.BLACKWALL_CONFIRMATION_WAIT_MS;
+  process.env.BLACKWALL_CONFIRMATION_WAIT_MS = 'Infinity';
+  let pollCount = 0;
+  // Count poll GETs; trip if the loop runs away.
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (url, init) => {
+    const method = init?.method ?? 'GET';
+    const u = String(url);
+    if (method === 'GET' && u.includes('/confirmations/')) {
+      pollCount += 1;
+      if (pollCount > 5) throw new Error('SPIN: budget not finite — poll ran away');
+    }
+    return origFetch(url, init);
+  };
+  const action = makeAction('send_money', async () => 'SENT');
+  const runtime = makeRuntime([action]);
+  // Huge pollMs ⇒ a single sleep covers the entire clamped budget ⇒ exactly one poll.
+  const plugin = blackwallGuardrail({ apiKey: 'bw_k', mode: 'enforce', confirmationPollMs: 99999999 });
+  await plugin.init(runtime);
+  forecastResponses.push({ body: confirmationVerdict() });
+  for (let i = 0; i < 10; i++) pollResponses.push({ body: { status: 'pending' } });
+
+  let threw = null;
+  try {
+    await Promise.race([
+      action.handler(runtime, { content: { text: 'pay' } }, {}, {}),
+      new Promise((_, r) => setTimeout(() => r(new Error('TIMEOUT: still spinning/hanging')), 3000)),
+    ]);
+  } catch (e) { threw = e; }
+
+  globalThis.fetch = origFetch;
+  if (prevEnv === undefined) delete process.env.BLACKWALL_CONFIRMATION_WAIT_MS;
+  else process.env.BLACKWALL_CONFIRMATION_WAIT_MS = prevEnv;
+
+  assert(threw !== null && /pending/i.test(threw.message), 'Infinity budget clamped → aborted pending (no spin)');
+  assert(pollCount <= 5, `poll loop bounded (polled ${pollCount}×, not runaway)`);
+}
+
+// ===========================================================================
+console.log('\n[14] audit L-2: apiKey is NOT sent to an OFF-ORIGIN poll_url; action fails closed');
+// NOTE non-vacuity: pre-fix the Authorization: Bearer <apiKey> header was attached
+// to whatever poll_url the verdict named — leaking the live credential to an
+// attacker-controlled host. Post-fix, off-origin poll_url gets no credential and
+// (unauthenticated) never approves ⇒ fail closed.
+{
+  reset();
+  let handlerRan = false;
+  const action = makeAction('send_money', async () => { handlerRan = true; return 'SENT'; });
+  const runtime = makeRuntime([action]);
+  const plugin = blackwallGuardrail({ apiKey: 'bw_LIVE_SECRET', mode: 'enforce', confirmationWaitMs: 0 });
+  await plugin.init(runtime);
+  forecastResponses.push({ body: confirmationVerdict({
+    confirmation: { id: 'c1', status: 'pending', poll_url: 'https://evil.attacker.example/api/v1/confirmations/c1' },
+  }) });
+  pollResponses.push({ body: { status: 'pending' } });
+
+  let threw = null;
+  try { await action.handler(runtime, { content: { text: 'pay' } }, {}, {}); } catch (e) { threw = e; }
+  const pollCall = fetchCalls.find((c) => c.url.includes('evil.attacker.example'));
+  const auth = pollCall?.headers?.Authorization ?? pollCall?.headers?.authorization;
+  assert(pollCall !== undefined, 'off-origin poll_url was still polled');
+  assert(!auth, 'apiKey NOT sent to off-origin poll_url (no Authorization header)');
+  assert(handlerRan === false, 'off-origin confirmation: handler did NOT run (fail closed)');
+  assert(threw !== null && /pending/i.test(threw.message), 'off-origin: threw pending');
+
+  // And the same-origin case still DOES carry the credential (no over-correction).
+  reset();
+  const action2 = makeAction('send_money', async () => 'SENT');
+  const runtime2 = makeRuntime([action2]);
+  const plugin2 = blackwallGuardrail({ apiKey: 'bw_LIVE_SECRET', mode: 'enforce', confirmationWaitMs: 250, confirmationPollMs: 250 });
+  await plugin2.init(runtime2);
+  forecastResponses.push({ body: confirmationVerdict() }); // default poll_url is on blackwalltier.com
+  pollResponses.push({ body: { status: 'pending' } });
+  try { await action2.handler(runtime2, { content: { text: 'pay' } }, {}, {}); } catch {}
+  const same = fetchCalls.find((c) => c.url.includes('/confirmations/'));
+  const sameAuth = same?.headers?.Authorization ?? same?.headers?.authorization;
+  assert(sameAuth === 'Bearer bw_LIVE_SECRET', 'same-origin poll_url STILL carries the apiKey');
+}
+
+// ===========================================================================
 console.log(`\n${failed === 0 ? 'All' : ''} confirmation tests done — ${passed} passed, ${failed} failed.\n`);
 if (failed > 0) process.exit(1);

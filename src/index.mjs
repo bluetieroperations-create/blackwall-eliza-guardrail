@@ -32,6 +32,23 @@ const actionForecastContext = new AsyncLocalStorage();
 // signal to reason about the action, not the full attachment.
 const DEFAULT_MAX_INPUT_BYTES = 8 * 1024;
 
+// Hard ceiling on the confirmation wall-clock budget. Even if an operator passes
+// (or env-supplies) Infinity / 1e999 / a garbage string, the enforce-mode poll
+// loop MUST terminate — an unbounded budget turns a "fail-closed" gate into a
+// silent hang that pins the agent forever. 10 minutes is far longer than any sane
+// human-approval wait inside a single action dispatch.
+const MAX_CONFIRMATION_WAIT_MS = 10 * 60 * 1000;
+
+/**
+ * Coerce a confirmation wait budget to a finite, non-negative number of ms,
+ * clamped to MAX_CONFIRMATION_WAIT_MS. NaN / non-finite / negative ⇒ 0 (the safe
+ * default: one check, abort if pending).
+ */
+function clampWaitMs(n) {
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.min(n, MAX_CONFIRMATION_WAIT_MS);
+}
+
 /**
  * @typedef {'enforce' | 'observe'} GuardrailMode
  */
@@ -92,9 +109,12 @@ function resolveConfig(config = {}) {
     //   DEFAULT 0 ⇒ check once, never wait: a still-pending confirmation aborts
     //   immediately (abort-and-surface). This is the SAFE default — zero safety
     //   regression vs v0.2.1, and no agent silently blocks for minutes.
-    confirmationWaitMs: Math.max(
-      0,
-      Number(config.confirmationWaitMs ?? process.env.BLACKWALL_CONFIRMATION_WAIT_MS ?? 0) || 0
+    //   CEILING: a non-finite value (`Infinity`, `1e999`, or the string forms of
+    //   either via env) would make the poll loop spin forever and silently pin the
+    //   agent — the budget is supposed to GUARANTEE the loop terminates. Clamp to a
+    //   finite max so the wall-clock budget is always honored regardless of input.
+    confirmationWaitMs: clampWaitMs(
+      Number(config.confirmationWaitMs ?? process.env.BLACKWALL_CONFIRMATION_WAIT_MS ?? 0)
     ),
     // confirmationPollMs — interval between polls. Floor 250ms so a bad config
     // can't hammer the API.
@@ -241,6 +261,35 @@ function hasConfirmationHandle(verdict) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+const DEFAULT_BASE_URL = 'https://blackwalltier.com';
+
+/**
+ * The apiKey is the operator's LIVE BLACK_WALL credential. poll_url is taken
+ * verbatim from the verdict (server-controlled). The forecast() sibling only ever
+ * sends the key to the configured baseUrl; this confirmation poll must not become
+ * a wider credential-egress channel than that. Defense-in-depth: only attach the
+ * Authorization header when the poll_url shares an origin with the configured
+ * baseUrl. An off-origin poll_url (server bug / response injection / future
+ * misconfig) is still polled, but WITHOUT the bearer — so the key never leaves the
+ * first-party origin, and an unauthenticated poll won't return `approved` ⇒ the
+ * action fails closed instead of leaking the credential.
+ */
+function pollAllowsAuth(pollUrl, baseUrl) {
+  let pollOrigin;
+  try {
+    pollOrigin = new URL(String(pollUrl)).origin;
+  } catch {
+    return false; // unparseable poll_url ⇒ never send the credential
+  }
+  let baseOrigin;
+  try {
+    baseOrigin = new URL(baseUrl ?? DEFAULT_BASE_URL).origin;
+  } catch {
+    baseOrigin = DEFAULT_BASE_URL;
+  }
+  return pollOrigin === baseOrigin;
+}
+
 /**
  * Poll a confirmation handle until it resolves or the wall-clock budget elapses.
  * FAIL CLOSED: returns 'approved' ONLY on an explicit 2xx `status:'approved'`.
@@ -256,7 +305,15 @@ async function pollConfirmation(verdict, cfg) {
   const fetchImpl = cfg.fetchImpl ?? globalThis.fetch;
   if (typeof fetchImpl !== 'function') return 'pending';
 
-  const deadline = Date.now() + cfg.confirmationWaitMs;
+  // Only ship the live apiKey to a same-origin (first-party) poll_url.
+  const headers = pollAllowsAuth(pollUrl, cfg.baseUrl)
+    ? { Authorization: `Bearer ${cfg.apiKey}` }
+    : {};
+
+  // Defense-in-depth: even if a non-finite budget slips past resolveConfig, the
+  // loop must still terminate. A non-finite deadline ⇒ check exactly once.
+  const waitMs = Number.isFinite(cfg.confirmationWaitMs) ? Math.max(0, cfg.confirmationWaitMs) : 0;
+  const deadline = Date.now() + waitMs;
 
   // Always check at least once (wait=0 ⇒ exactly one check, no sleep).
   // After each check, only sleep + re-poll if there is budget remaining.
@@ -265,7 +322,7 @@ async function pollConfirmation(verdict, cfg) {
     try {
       const res = await fetchImpl(pollUrl, {
         method: 'GET',
-        headers: { Authorization: `Bearer ${cfg.apiKey}` },
+        headers,
       });
       if (!res || !res.ok) {
         status = undefined; // non-2xx ⇒ treat as pending (fail-closed)
