@@ -439,6 +439,35 @@ await runTest('[F1d] enforce + confirmation present but NON-OBJECT shape (functi
 });
 
 // ===========================================================================
+await runTest('[F1e] enforce + CAUTION + confirmation is a bare STRING → NOT a confirmation requirement (runs as CAUTION)', async () => {
+// NOTE non-vacuity / MUTATION (audit L-1): the predicate is
+// `c != null && typeof c !== 'string'`. The string-EXCLUSION clause is a
+// deliberate routing choice: a bare string is not a usable confirmation handle
+// (the server never emits one), so it must NOT enter the confirmation branch —
+// it falls through to the GO/CAUTION run path. This pins that choice; dropping
+// the `typeof c !== 'string'` clause (so a string becomes a "requirement") would
+// flip this action from RUN to fail-closed-abort and trip THIS test.
+  reset();
+  let handlerRan = false;
+  const action = makeAction('post_note', async () => { handlerRan = true; return 'NOTED'; });
+  const runtime = makeRuntime([action]);
+  const events = [];
+  const plugin = blackwallGuardrail({ apiKey: 'bw_k', mode: 'enforce', onEvent: (e) => events.push(e) });
+  await plugin.init(runtime);
+
+  // CAUTION verdict whose `confirmation` is a bare string (not a handle object).
+  forecastResponses.push({ body: confirmationVerdict({ confirmation: 'conf_123' }) });
+
+  const result = await action.handler(runtime, { content: { text: 'note' } }, {}, {});
+  await new Promise((r) => setTimeout(r, 10));
+
+  assert(handlerRan === true, 'string confirmation: NOT gated → handler RAN (CAUTION path)');
+  assert(result === 'NOTED', 'string confirmation: returned handler result');
+  assert(!events.some((e) => e.type === 'confirmation_required'), 'string confirmation: no confirmation_required event');
+  assert(!fetchCalls.some((c) => c.url.includes('/confirmations/')), 'string confirmation: never polled');
+});
+
+// ===========================================================================
 await runTest('[F1c] observe + confirmation present + poll_url MISSING → handler RAN (observe contract unchanged)', async () => {
 // NOTE non-vacuity: observe must NEVER alter behavior even on a malformed handle.
 // The FIX-1 fail-closed branch is gated behind enforce; in observe the action
