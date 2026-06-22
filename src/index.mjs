@@ -66,11 +66,12 @@ function clampWaitMs(n) {
  * @property {number} [confirmationPollMs] Interval (ms) between confirmation polls. Floor 250. Default 2000. Env BLACKWALL_CONFIRMATION_POLL_MS.
  * @property {(handle: object, meta: { actionName: string, verdict: object }) => void} [onConfirmationRequired] Best-effort callback fired (both modes) when the gate returns a confirmation handle — your hook to route a human-approval prompt out of band. Errors are swallowed.
  * @property {typeof fetch} [fetchImpl] Inject a fetch implementation for the confirmation poll (tests / proxy). Defaults to globalThis.fetch.
+ * @property {boolean | string | string[] | ((actionName: string) => boolean)} [failClosed] Opt-in fail-closed on gate OUTAGE (forecast() throws). DEFAULT false = fail-open (run ungated; backward-compat). true = fail closed for ALL actions; string[] = fail closed only for listed action names; predicate = fail closed when it returns true. A string is parsed like the env var ('true'/'false' or comma-separated list). Enforce mode only; observe is never affected. Env fallback BLACKWALL_FAIL_CLOSED; config wins over env.
  */
 
 /**
  * @typedef {Object} GuardrailEvent
- * @property {'wrapped'|'forecast_error'|'stop'|'observe_error'|'skipped'|'init'|'confirmation_required'|'confirmation_approved'|'confirmation_rejected'|'confirmation_pending'} type
+ * @property {'wrapped'|'forecast_error'|'fail_closed'|'stop'|'observe_error'|'skipped'|'init'|'confirmation_required'|'confirmation_approved'|'confirmation_rejected'|'confirmation_pending'} type
  * @property {string} [actionName]
  * @property {string} [forecastId]
  * @property {string} [recommendation]
@@ -128,7 +129,142 @@ function resolveConfig(config = {}) {
       typeof config.onConfirmationRequired === 'function' ? config.onConfirmationRequired : null,
     // Injectable fetch (tests / proxy). Mirrors how blackwall-mcp allows opts.fetch.
     fetchImpl: typeof config.fetchImpl === 'function' ? config.fetchImpl : null,
+    // Fail-closed on gate OUTAGE (v0.4.0). When forecast() THROWS (gate down /
+    // network / timeout / verdict-less body), the DEFAULT is fail-OPEN — the
+    // wrapped handler runs ungated (v0.2.x availability doctrine; backward-compat).
+    // For high-stakes actions an operator can opt into fail-CLOSED: on a forecast
+    // error in ENFORCE mode, abort instead of run. Resolved here to a normalized
+    // predicate `shouldFailClosed(actionName) => boolean`. Config wins over env.
+    // This ONLY affects the forecast-ERROR path in enforce mode; it can never make
+    // an action that previously aborted run, and observe mode is never affected.
+    shouldFailClosed: resolveFailClosed(config.failClosed),
   };
+}
+
+/**
+ * Normalize the `failClosed` config (and BLACKWALL_FAIL_CLOSED env fallback) to a
+ * predicate `(actionName) => boolean`. Config value wins over env entirely (a
+ * present config — even `false` — suppresses the env).
+ *
+ * Accepted config forms:
+ *   - false (DEFAULT)            → never fail closed (fail-open; backward-compat)
+ *   - true                       → fail closed for ALL actions
+ *   - string[]                   → fail closed ONLY for listed action names
+ *   - (actionName) => boolean    → predicate
+ *
+ * A STRING config value is parsed with the SAME semantics as the env var, so a
+ * "stringified boolean" typo (`failClosed: 'false'`) means NONE — it can never
+ * silently invert to fail-closed-for-all the way a blind truthy-coercion would
+ * (audit L-1 hardening: this is a high-stakes control, so a malformed value must
+ * not flip its meaning).
+ *
+ * Env BLACKWALL_FAIL_CLOSED (only consulted when config.failClosed is undefined):
+ *   - 'true' / 'false'           → all / none
+ *   - 'PAY_A,PAY_B'              → comma-separated action list
+ *
+ * @param {boolean | string | string[] | ((actionName: string) => boolean) | undefined} failClosed
+ * @returns {(actionName: string) => boolean}
+ */
+const FAIL_CLOSED_NEVER = () => false;
+const FAIL_CLOSED_ALWAYS = () => true;
+
+/**
+ * Parse a string fail-closed spec ('true' / 'false' / comma-list) to a predicate.
+ * Shared by the string-config and env paths so both behave identically.
+ */
+function parseFailClosedString(raw) {
+  const trimmed = String(raw).trim();
+  if (trimmed === '') return FAIL_CLOSED_NEVER;
+  const lower = trimmed.toLowerCase();
+  if (lower === 'true') return FAIL_CLOSED_ALWAYS;
+  if (lower === 'false') return FAIL_CLOSED_NEVER;
+  const set = new Set(
+    trimmed.split(',').map((s) => s.trim()).filter((s) => s !== '')
+  );
+  return (actionName) => set.has(actionName);
+}
+
+function resolveFailClosed(failClosed) {
+  // Build a predicate from a config value (config wins over env).
+  if (failClosed !== undefined) {
+    if (typeof failClosed === 'function') {
+      // Wrap so a throwing predicate can't take down the wrap; a throw ⇒ treat
+      // as "not configured for this action" (fail-open) rather than crash.
+      return (actionName) => {
+        try {
+          return failClosed(actionName) === true;
+        } catch {
+          return false;
+        }
+      };
+    }
+    if (Array.isArray(failClosed)) {
+      const set = new Set(failClosed.filter((n) => typeof n === 'string'));
+      return (actionName) => set.has(actionName);
+    }
+    if (typeof failClosed === 'boolean') {
+      return failClosed ? FAIL_CLOSED_ALWAYS : FAIL_CLOSED_NEVER;
+    }
+    // A STRING config is parsed like the env var (so 'false' means NONE, not a
+    // truthy-coerce to ALL). Any OTHER off-contract type (number, object, etc.)
+    // is treated as the safe default (fail-OPEN / NEVER) rather than blindly
+    // truthy-coerced — a malformed high-stakes config must not silently invert.
+    if (typeof failClosed === 'string') {
+      return parseFailClosedString(failClosed);
+    }
+    return FAIL_CLOSED_NEVER;
+  }
+
+  // Env fallback — only when config did not specify failClosed at all.
+  const env = process.env.BLACKWALL_FAIL_CLOSED;
+  if (env === undefined) return FAIL_CLOSED_NEVER;
+  return parseFailClosedString(env);
+}
+
+/**
+ * Shared forecast-ERROR handler used by BOTH the action-handler wrap AND
+ * gateCall(). Decides what to do when forecast() THROWS (gate outage / network /
+ * timeout / verdict-less body) — BEFORE any verdict exists.
+ *
+ * This is the ONLY place the fail-open-vs-fail-closed posture is decided, and it
+ * is decided IDENTICALLY at both call sites:
+ *
+ *   - ENFORCE mode AND cfg.shouldFailClosed(actionName) ⇒ FAIL CLOSED: emit a
+ *     `fail_closed` telemetry event, warn, and THROW. The original handler/step
+ *     does NOT run.
+ *   - otherwise ⇒ current FAIL-OPEN behavior: warn, emit `forecast_error`, and
+ *     RUN the original handler/step ungated (availability doctrine, backward-compat).
+ *
+ * SAFETY: this can ONLY make enforce MORE restrictive (abort instead of run) for
+ * configured actions on the forecast-error path. It is structurally impossible for
+ * it to make an action that previously aborted now run: the fail-open branch is
+ * exactly the prior behavior, and the new branch only ever THROWS.
+ *
+ * observe mode never reaches the throw branch (the enforce guard), so the observe
+ * contract (never abort) is preserved.
+ *
+ * @param {Object} p
+ * @param {string} p.actionName
+ * @param {unknown} p.err                    the error forecast() threw
+ * @param {Object} p.cfg                     resolved config
+ * @param {{ warn?: (msg: string) => void } | null | undefined} p.logger
+ * @param {() => any} p.runOriginal          run the original handler/step (fail-open)
+ * @returns {any} the original handler/step result when failing open
+ * @throws the fail-closed error when enforce + configured to fail closed
+ */
+function onForecastError({ actionName, err, cfg, logger, runOriginal }) {
+  if (cfg.mode === 'enforce' && cfg.shouldFailClosed(actionName)) {
+    emit(cfg.onEvent, { type: 'fail_closed', actionName, error: err });
+    const msg = `BLACK_WALL: gate unavailable — failing closed for action "${actionName}" (forecast error: ${err?.message ?? err})`;
+    logger?.warn?.(`[blackwall-guardrail] ${msg}`);
+    throw new Error(msg);
+  }
+  // Fail-open (default): a BLACK_WALL outage must never break the agent.
+  logger?.warn?.(
+    `[blackwall-guardrail] forecast() failed for action "${actionName}" — proceeding without gate: ${err?.message ?? err}`
+  );
+  emit(cfg.onEvent, { type: 'forecast_error', actionName, error: err });
+  return runOriginal();
 }
 
 /**
@@ -558,10 +694,17 @@ export async function gateCall(action, inputs, run, opts = {}) {
       { apiKey: cfg.apiKey, baseUrl: cfg.baseUrl }
     );
   } catch (err) {
-    // Fail-open, same doctrine as the action wrap: a BLACK_WALL outage must never
-    // break the agent. Run the step ungated.
-    emit(cfg.onEvent, { type: 'forecast_error', actionName: action, error: err });
-    return run();
+    // Gate outage (forecast threw). Same posture decision as the action wrap,
+    // shared via onForecastError(): default fail-OPEN (run the step ungated), or
+    // fail-CLOSED (abort) when enforce + the step is configured via `failClosed`.
+    // gateCall has no Eliza logger; pass null (telemetry still fires via onEvent).
+    return onForecastError({
+      actionName: action,
+      err,
+      cfg,
+      logger: null,
+      runOriginal: run,
+    });
   }
 
   const reportedVia = 'eliza_guardrail';
@@ -631,12 +774,18 @@ function wrapActionHandler(action, cfg, logger) {
         { apiKey: cfg.apiKey, baseUrl: cfg.baseUrl }
       );
     } catch (err) {
-      // Fail-open: never let a BLACK_WALL outage break the agent. Log and let
-      // the action proceed. Operators can switch to enforce-strict in a future
-      // version if they want fail-closed semantics.
-      logger?.warn?.(`[blackwall-guardrail] forecast() failed for action "${action.name}" — proceeding without gate: ${err?.message ?? err}`);
-      emit(cfg.onEvent, { type: 'forecast_error', actionName: action.name, error: err });
-      return original.call(this, runtime, message, state, opts, callback, responses);
+      // Gate outage (forecast threw). Default is fail-OPEN (run ungated) so a
+      // BLACK_WALL outage never breaks the agent; an operator can opt into
+      // fail-CLOSED (abort in enforce mode) per action via `failClosed`. The
+      // posture decision lives in onForecastError(), shared with gateCall().
+      const self = this;
+      return onForecastError({
+        actionName: action.name,
+        err,
+        cfg,
+        logger,
+        runOriginal: () => original.call(self, runtime, message, state, opts, callback, responses),
+      });
     }
 
     // Best-effort observe(aborted) — don't await; the throw must hit Eliza's

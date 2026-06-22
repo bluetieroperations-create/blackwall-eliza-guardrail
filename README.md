@@ -84,6 +84,42 @@ blackwallGuardrail({
 
 Failure is **closed**: an unverifiable approval (timeout, network error, garbage body) is treated as *not approved*. The action does not run.
 
+## Gate outage: fail-open (default) vs fail-closed (opt-in)
+
+When `forecast()` **throws** — BLACK_WALL is down, the network times out, or the server returns a 2xx body with no usable verdict — the plugin has to decide whether to run the action *without* a gate decision. This is a **security-vs-availability tradeoff**, and it is distinct from the confirmation poll above (which fails closed only *after* a successful forecast returns a confirmation requirement).
+
+- **Default — fail-OPEN.** A BLACK_WALL outage must never break your agent, so the wrapped handler **runs ungated**, logs a warning, and emits a `forecast_error` event. This is the v0.2.x/v0.3.x availability doctrine and is **unchanged** — drop-in upgrades keep failing open.
+- **Opt-in — fail-CLOSED.** For high-stakes actions (payments, transfers, irreversible writes), running ungated on an outage is a hole: an attacker who can *induce* a gate outage gets every action run unprotected. Set `failClosed` and, **in enforce mode**, a forecast error on a configured action **aborts** instead of running — the plugin emits a `fail_closed` event and throws `BLACK_WALL: gate unavailable — failing closed for action "<name>" (forecast error: <msg>)`.
+
+`failClosed` accepts:
+
+| Value | Effect on a forecast error (enforce mode) |
+|---|---|
+| `false` (**default**) | Fail open — run ungated (backward-compatible). |
+| `true` | Fail closed for **all** actions. |
+| `string[]` | Fail closed **only** for actions whose name is in the list. |
+| `(actionName) => boolean` | Fail closed when the predicate returns `true`. |
+
+Env fallback **`BLACKWALL_FAIL_CLOSED`**: `'true'` / `'false'`, or a comma-separated action list (`PAY_NEW_PAYEE,TRANSFER`). A `failClosed` config value **always wins over** the env var. A **string** config value is parsed with the same rules as the env var (so `failClosed: 'false'` means *none* — it never silently inverts to fail-closed-for-all); any other off-contract type falls back to the safe default (fail-open).
+
+```ts
+blackwallGuardrail({
+  mode: 'enforce',
+  // Only payments fail closed on an outage; everything else stays fail-open.
+  failClosed: ['PAY_NEW_PAYEE', 'TRANSFER'],
+  // or: failClosed: true                       // all actions
+  // or: failClosed: (name) => name.startsWith('PAY')
+});
+```
+
+**Scope — this can only make enforce *more* restrictive.** `failClosed` changes behavior **only** on the forecast-error path, and **only** in enforce mode:
+
+- **observe mode is never affected** — observe never aborts (its contract), so `failClosed` is a no-op there; the action always runs on a forecast error.
+- The **verdict paths are untouched** — a successful `GO` still runs, a `STOP` still aborts with its normal error, and a confirmation verdict still polls. `failClosed` never fires on any of these.
+- For a configured action, the only change is **abort instead of run** on an outage. It is structurally impossible for `failClosed` to cause an action to *run* that previously aborted: the fail-open branch is byte-for-byte the prior behavior, and the new branch only ever throws.
+
+`gateCall()` honors `failClosed` identically (the posture decision is shared between the action wrap and `gateCall()`), so per-call steps inside a multi-step handler also fail closed on an outage when configured.
+
 ## Why list it LAST
 
 The plugin wraps `runtime.actions[*].handler` at `init()` time. Actions registered *after* this plugin's init won't be wrapped. Listing it last guarantees every action other plugins contribute is gated.
@@ -100,6 +136,7 @@ blackwallGuardrail({
   shouldGate: (actionName) => actionName !== 'IGNORE',  // per-action opt-out
   maxInputBytes: 8 * 1024,                // hard cap on the forecast payload size
   sendUserIntent: false,                  // do NOT send the user's message text (see Data & privacy)
+  failClosed: ['PAY_NEW_PAYEE'],          // abort (don't run) on a gate OUTAGE — enforce only. Default false = fail-open. Env BLACKWALL_FAIL_CLOSED
   onEvent: (event) => myTelemetry(event), // optional telemetry hook
 
   // Human-in-the-loop confirmation flow (v0.3.0):
@@ -111,7 +148,7 @@ blackwallGuardrail({
 
 ### Telemetry events
 
-`onEvent` fires for: `init`, `wrapped`, `skipped`, `forecast_error`, `stop`, `observe_error`, and the confirmation events `confirmation_required`, `confirmation_approved`, `confirmation_rejected`, `confirmation_pending`. Useful for piping guardrail decisions into your own observability stack.
+`onEvent` fires for: `init`, `wrapped`, `skipped`, `forecast_error`, `fail_closed`, `stop`, `observe_error`, and the confirmation events `confirmation_required`, `confirmation_approved`, `confirmation_rejected`, `confirmation_pending`. Useful for piping guardrail decisions into your own observability stack. (`forecast_error` fires when a gate outage is handled fail-open; `fail_closed` fires when it is handled fail-closed — see [fail-closed](#gate-outage-fail-open-default-vs-fail-closed-opt-in).)
 
 ## How it works
 
@@ -120,7 +157,7 @@ blackwallGuardrail({
 3. In `enforce` mode, a `STOP` verdict throws — Eliza's dispatcher catches it and the action does not run.
 4. After the action runs (or after a STOP), the wrapper calls `/api/v1/forecast/:id/outcome` so BLACK_WALL can learn from real-world divergence.
 
-Fail-open: if BLACK_WALL is unreachable, the wrapper logs a warning and lets the action proceed. Network glitches at BLACK_WALL won't take down your agent.
+Fail-open (default): if BLACK_WALL is unreachable, the wrapper logs a warning and lets the action proceed. Network glitches at BLACK_WALL won't take down your agent. For high-stakes actions you can opt into [fail-closed](#gate-outage-fail-open-default-vs-fail-closed-opt-in) so an outage aborts instead.
 
 ## Data & privacy
 
@@ -185,6 +222,13 @@ Nothing custodial — no funds, keys, or private data leave your side. ~10 minut
 **→ Apply as a design partner** (2-min form): https://docs.google.com/forms/d/e/1FAIpQLScw4TxRhMn-qrg91jDyvP0U2-yzcEmKxdwqINbNhoka4hUkXA/viewform — or [open an issue](https://github.com/bluetieroperations-create/blackwall-eliza-guardrail/issues/new).
 
 ## Changelog
+
+### 0.4.0
+
+- **Opt-in fail-closed on gate outage.** New config `failClosed` (env fallback `BLACKWALL_FAIL_CLOSED`). When `forecast()` throws (gate down / network / timeout / verdict-less body) in **enforce** mode, a configured action now **aborts** instead of running ungated. Accepts `false` (default — fail-open, backward-compatible), `true` (all actions), a `string[]` of action names, or a `(actionName) => boolean` predicate. Config wins over env. See [Gate outage: fail-open vs fail-closed](#gate-outage-fail-open-default-vs-fail-closed-opt-in).
+- **Default is unchanged (fail-OPEN).** Existing installs upgrade with zero behavior change. This release can only make enforce *more* restrictive for explicitly-configured actions, and **only** on the forecast-error path — verdict paths (GO/STOP/confirmation) and observe mode are untouched. It is structurally impossible for `failClosed` to make an action run that previously aborted.
+- New telemetry event: `fail_closed` (emitted instead of `forecast_error` when an outage is handled fail-closed).
+- `gateCall()` honors `failClosed` via the same shared `onForecastError` path as the action wrap.
 
 ### 0.3.0
 
