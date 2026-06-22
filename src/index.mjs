@@ -32,6 +32,23 @@ const actionForecastContext = new AsyncLocalStorage();
 // signal to reason about the action, not the full attachment.
 const DEFAULT_MAX_INPUT_BYTES = 8 * 1024;
 
+// Hard ceiling on the confirmation wall-clock budget. Even if an operator passes
+// (or env-supplies) Infinity / 1e999 / a garbage string, the enforce-mode poll
+// loop MUST terminate — an unbounded budget turns a "fail-closed" gate into a
+// silent hang that pins the agent forever. 10 minutes is far longer than any sane
+// human-approval wait inside a single action dispatch.
+const MAX_CONFIRMATION_WAIT_MS = 10 * 60 * 1000;
+
+/**
+ * Coerce a confirmation wait budget to a finite, non-negative number of ms,
+ * clamped to MAX_CONFIRMATION_WAIT_MS. NaN / non-finite / negative ⇒ 0 (the safe
+ * default: one check, abort if pending).
+ */
+function clampWaitMs(n) {
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.min(n, MAX_CONFIRMATION_WAIT_MS);
+}
+
 /**
  * @typedef {'enforce' | 'observe'} GuardrailMode
  */
@@ -44,12 +61,16 @@ const DEFAULT_MAX_INPUT_BYTES = 8 * 1024;
  * @property {(actionName: string) => boolean} [shouldGate] Per-action opt-out. Return false to skip wrapping.
  * @property {number} [maxInputBytes] Hard cap on the forecast() inputs payload size. Default 8KB.
  * @property {boolean} [sendUserIntent] Send the raw inbound user message as context.user_intent. Default true; set false (or BLACKWALL_SEND_USER_INTENT=false) to keep user message text on-box.
- * @property {(event: GuardrailEvent) => void} [onEvent] Telemetry hook (logged on STOP, error, observe failure, etc.).
+ * @property {(event: GuardrailEvent) => void} [onEvent] Telemetry hook (logged on STOP, error, observe failure, confirmation events, etc.).
+ * @property {number} [confirmationWaitMs] Enforce-mode total wall-clock budget (ms) to wait for a human-approval confirmation. Default 0 ⇒ check once, abort-and-surface if still pending. Env BLACKWALL_CONFIRMATION_WAIT_MS.
+ * @property {number} [confirmationPollMs] Interval (ms) between confirmation polls. Floor 250. Default 2000. Env BLACKWALL_CONFIRMATION_POLL_MS.
+ * @property {(handle: object, meta: { actionName: string, verdict: object }) => void} [onConfirmationRequired] Best-effort callback fired (both modes) when the gate returns a confirmation handle — your hook to route a human-approval prompt out of band. Errors are swallowed.
+ * @property {typeof fetch} [fetchImpl] Inject a fetch implementation for the confirmation poll (tests / proxy). Defaults to globalThis.fetch.
  */
 
 /**
  * @typedef {Object} GuardrailEvent
- * @property {'wrapped'|'forecast_error'|'stop'|'observe_error'|'skipped'|'init'} type
+ * @property {'wrapped'|'forecast_error'|'stop'|'observe_error'|'skipped'|'init'|'confirmation_required'|'confirmation_approved'|'confirmation_rejected'|'confirmation_pending'} type
  * @property {string} [actionName]
  * @property {string} [forecastId]
  * @property {string} [recommendation]
@@ -80,6 +101,33 @@ function resolveConfig(config = {}) {
         ? config.sendUserIntent !== false
         : process.env.BLACKWALL_SEND_USER_INTENT !== 'false',
     onEvent: typeof config.onEvent === 'function' ? config.onEvent : null,
+    // Confirmation flow (v0.3.0). When a verdict carries a server-offered
+    // human-approval handle (verdict.confirmation.poll_url), enforce mode polls
+    // it for an explicit `approved` before letting the action run.
+    //
+    // confirmationWaitMs — total wall-clock budget to wait for approval.
+    //   DEFAULT 0 ⇒ check once, never wait: a still-pending confirmation aborts
+    //   immediately (abort-and-surface). This is the SAFE default — zero safety
+    //   regression vs v0.2.1, and no agent silently blocks for minutes.
+    //   CEILING: a non-finite value (`Infinity`, `1e999`, or the string forms of
+    //   either via env) would make the poll loop spin forever and silently pin the
+    //   agent — the budget is supposed to GUARANTEE the loop terminates. Clamp to a
+    //   finite max so the wall-clock budget is always honored regardless of input.
+    confirmationWaitMs: clampWaitMs(
+      Number(config.confirmationWaitMs ?? process.env.BLACKWALL_CONFIRMATION_WAIT_MS ?? 0)
+    ),
+    // confirmationPollMs — interval between polls. Floor 250ms so a bad config
+    // can't hammer the API.
+    confirmationPollMs: Math.max(
+      250,
+      Number(config.confirmationPollMs ?? process.env.BLACKWALL_CONFIRMATION_POLL_MS ?? 2000) || 2000
+    ),
+    // Optional callback fired (best-effort) whenever a confirmation is required,
+    // in BOTH modes — your hook to route a human-approval prompt out of band.
+    onConfirmationRequired:
+      typeof config.onConfirmationRequired === 'function' ? config.onConfirmationRequired : null,
+    // Injectable fetch (tests / proxy). Mirrors how blackwall-mcp allows opts.fetch.
+    fetchImpl: typeof config.fetchImpl === 'function' ? config.fetchImpl : null,
   };
 }
 
@@ -195,6 +243,274 @@ function emit(onEvent, event) {
 }
 
 /**
+ * True when the verdict carries a hard, non-overridable block. Strictest-wins:
+ * a hard block beats any confirmation handle that may also be present.
+ */
+function hasHardBlocks(verdict) {
+  return Array.isArray(verdict?.hard_blocks) && verdict.hard_blocks.length > 0;
+}
+
+/**
+ * True when the server signalled a human-confirmation REQUIREMENT for this
+ * verdict. We key off the PRESENCE of the confirmation object (or its id) — NOT
+ * off poll_url.
+ *
+ * This is the fail-CLOSED detection (audit fix): a malformed/partial server
+ * response that carries a `confirmation` object but a missing/empty `poll_url`
+ * still REQUIRES confirmation. Keying off poll_url here let such a verdict fall
+ * through to the GO/CAUTION path and RUN ungated in enforce mode — defeating the
+ * gate. By detecting on presence, the confirmation branch always owns the
+ * decision, and it (not this predicate) decides fail-closed when there is
+ * nothing pollable.
+ */
+function hasConfirmationHandle(verdict) {
+  const c = verdict?.confirmation;
+  // Any PRESENT, non-null confirmation that is not a bare string is a
+  // requirement: object (incl. {} / array / null-proto), or a function. We
+  // exclude only nullish and string (a string is not a usable handle, and the
+  // server never emits one). Keying off `typeof === 'object'` alone would let a
+  // function-shaped confirmation slip through to the ungated run path; over JSON
+  // that shape can't arrive, but this is the strictly fail-closed predicate.
+  return c != null && typeof c !== 'string';
+}
+
+/**
+ * True when the confirmation handle carries a usable, SAME-ORIGIN poll_url we
+ * can actually authenticate against. A missing/empty/non-string poll_url, or an
+ * off-origin one (we never send the bearer off-origin, so it can never approve),
+ * is NOT pollable — in enforce mode that must fail closed, never run ungated.
+ */
+function hasPollableUrl(verdict, cfg) {
+  const pollUrl = verdict?.confirmation?.poll_url;
+  if (typeof pollUrl !== 'string' || pollUrl.trim() === '') return false;
+  // Off-origin ⇒ unauthable ⇒ can never return approved ⇒ not usefully pollable.
+  return pollAllowsAuth(pollUrl, cfg.baseUrl);
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const DEFAULT_BASE_URL = 'https://blackwalltier.com';
+
+/**
+ * The apiKey is the operator's LIVE BLACK_WALL credential. poll_url is taken
+ * verbatim from the verdict (server-controlled). The forecast() sibling only ever
+ * sends the key to the configured baseUrl; this confirmation poll must not become
+ * a wider credential-egress channel than that. Defense-in-depth: only attach the
+ * Authorization header when the poll_url shares an origin with the configured
+ * baseUrl. An off-origin poll_url (server bug / response injection / future
+ * misconfig) is still polled, but WITHOUT the bearer — so the key never leaves the
+ * first-party origin, and an unauthenticated poll won't return `approved` ⇒ the
+ * action fails closed instead of leaking the credential.
+ */
+function pollAllowsAuth(pollUrl, baseUrl) {
+  let pollOrigin;
+  try {
+    pollOrigin = new URL(String(pollUrl)).origin;
+  } catch {
+    return false; // unparseable poll_url ⇒ never send the credential
+  }
+  let baseOrigin;
+  try {
+    baseOrigin = new URL(baseUrl ?? DEFAULT_BASE_URL).origin;
+  } catch {
+    baseOrigin = DEFAULT_BASE_URL;
+  }
+  return pollOrigin === baseOrigin;
+}
+
+/**
+ * Poll a confirmation handle until it resolves or the wall-clock budget elapses.
+ * FAIL CLOSED: returns 'approved' ONLY on an explicit 2xx `status:'approved'`.
+ * Any error, non-2xx, unparseable body, missing/garbage status, or budget
+ * expiry → 'pending'. 'rejected' is returned only on explicit 2xx rejection.
+ *
+ * Never throws — the caller decides what a non-'approved' result means.
+ *
+ * @returns {Promise<'approved'|'rejected'|'pending'>}
+ */
+async function pollConfirmation(verdict, cfg) {
+  const pollUrl = verdict.confirmation.poll_url;
+  const fetchImpl = cfg.fetchImpl ?? globalThis.fetch;
+  if (typeof fetchImpl !== 'function') return 'pending';
+
+  // Only ship the live apiKey to a same-origin (first-party) poll_url.
+  const headers = pollAllowsAuth(pollUrl, cfg.baseUrl)
+    ? { Authorization: `Bearer ${cfg.apiKey}` }
+    : {};
+
+  // Defense-in-depth: even if a non-finite budget slips past resolveConfig, the
+  // loop must still terminate. A non-finite deadline ⇒ check exactly once.
+  const waitMs = Number.isFinite(cfg.confirmationWaitMs) ? Math.max(0, cfg.confirmationWaitMs) : 0;
+  const deadline = Date.now() + waitMs;
+
+  // Always check at least once (wait=0 ⇒ exactly one check, no sleep).
+  // After each check, only sleep + re-poll if there is budget remaining.
+  for (;;) {
+    let status;
+    try {
+      const res = await fetchImpl(pollUrl, {
+        method: 'GET',
+        headers,
+      });
+      if (!res || !res.ok) {
+        status = undefined; // non-2xx ⇒ treat as pending (fail-closed)
+      } else {
+        const body = await res.json().catch(() => null);
+        status =
+          body && typeof body === 'object' && typeof body.status === 'string'
+            ? body.status.trim().toLowerCase()
+            : undefined;
+      }
+    } catch {
+      // network / fetch failure ⇒ fail-closed pending. Never let it escape.
+      status = undefined;
+    }
+
+    if (status === 'approved') return 'approved';
+    if (status === 'rejected') return 'rejected';
+    // anything else (pending / missing / garbage) ⇒ keep waiting if budget allows.
+
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return 'pending';
+    // Don't sleep past the deadline.
+    await sleep(Math.min(cfg.confirmationPollMs, remaining));
+    if (Date.now() >= deadline) {
+      // Budget elapsed during the sleep — do not poll again; surface pending.
+      // (One final check already happened above; another would overrun the budget.)
+      return 'pending';
+    }
+  }
+}
+
+/**
+ * Shared verdict-handling path used by BOTH the action-handler wrap AND
+ * gateCall(). Decides what to do AFTER a successful forecast() returns `verdict`,
+ * then delegates the actual run/observe back to `runAndObserve` so the two call
+ * sites keep their own observe wiring.
+ *
+ * Precedence (strictest-wins):
+ *   1. hard_blocks present        → hard STOP (enforce: throw; observe: run)
+ *   2. confirmation handle present→ confirmation flow (enforce: poll; observe: run)
+ *   3. legacy STOP                → enforce throws; observe runs
+ *   4. else (GO/CAUTION)          → run
+ *
+ * THE SAFETY INVARIANT: in enforce mode, an action with a confirmation handle
+ * NEVER runs unless pollConfirmation() returned 'approved'. Default wait=0 ⇒
+ * pending ⇒ abort. Poll error/timeout/rejected ⇒ abort. Only 'approved' runs.
+ *
+ * @param {Object} p
+ * @param {Record<string,any>} p.verdict
+ * @param {string} p.actionName
+ * @param {Object} p.cfg                resolved config
+ * @param {() => Promise<any>} p.runAndObserve  run the original step + observe matched/diverged
+ * @param {(o:object, detail?:string)=>void} p.observeAborted  fire-and-forget observe(aborted)
+ * @param {(message:string)=>Error} p.makeHardStopError  build the legacy/hard-stop throw
+ * @returns {Promise<any>} the step result when allowed
+ * @throws when the action must NOT run (hard stop, legacy STOP, rejected, pending)
+ */
+async function handleVerdict({ verdict, actionName, cfg, runAndObserve, observeAborted, makeHardStopError }) {
+  const enforce = cfg.mode === 'enforce';
+
+  // 1. Hard stop wins — never enter the confirmation flow.
+  if (hasHardBlocks(verdict)) {
+    emit(cfg.onEvent, {
+      type: 'stop',
+      actionName,
+      forecastId: verdict?.id,
+      recommendation: verdict?.recommendation,
+      extra: { hard_blocks: verdict.hard_blocks.length },
+    });
+    if (enforce) {
+      observeAborted('blocked by enforce-mode guardrail (hard_blocks)');
+      const codes = verdict.hard_blocks.map((b) => b?.code).filter(Boolean).join(', ');
+      throw makeHardStopError(codes);
+    }
+    // observe: log + run.
+    return runAndObserve();
+  }
+
+  // 2. Confirmation path — server offered a human-approval handle.
+  if (hasConfirmationHandle(verdict)) {
+    const handle = verdict.confirmation;
+    emit(cfg.onEvent, {
+      type: 'confirmation_required',
+      actionName,
+      forecastId: verdict?.id,
+      extra: { confirmationId: handle.id, status: handle.status, pollUrl: handle.poll_url },
+    });
+    if (cfg.onConfirmationRequired) {
+      try {
+        cfg.onConfirmationRequired(handle, { actionName, verdict });
+      } catch {
+        /* a broken callback must never break the wrap */
+      }
+    }
+
+    // observe mode: NEVER block — observe's contract is to never alter behavior.
+    if (!enforce) {
+      return runAndObserve();
+    }
+
+    // enforce mode: a confirmation is REQUIRED. If there is no pollable,
+    // same-origin poll_url (missing / empty / non-string, or off-origin so we
+    // can never authenticate the poll), there is no way to obtain an explicit
+    // `approved` — so FAIL CLOSED. Running here would be the ungated-run gap the
+    // audit found (confirmation present but no usable handle ⇒ action ran).
+    if (!hasPollableUrl(verdict, cfg)) {
+      emit(cfg.onEvent, {
+        type: 'confirmation_pending',
+        actionName,
+        forecastId: verdict?.id,
+        extra: { confirmationId: handle?.id, pollUrl: handle?.poll_url, reason: 'no-pollable-url' },
+      });
+      observeAborted('confirmation required but no pollable approval URL');
+      throw new Error(
+        `BLACK_WALL: action "${actionName}" requires human confirmation but no pollable approval URL was provided`
+      );
+    }
+
+    // enforce mode: poll for an explicit approval. Fail closed otherwise.
+    const outcome = await pollConfirmation(verdict, cfg);
+    if (outcome === 'approved') {
+      emit(cfg.onEvent, { type: 'confirmation_approved', actionName, forecastId: verdict?.id, extra: { confirmationId: handle.id } });
+      return runAndObserve();
+    }
+    if (outcome === 'rejected') {
+      emit(cfg.onEvent, { type: 'confirmation_rejected', actionName, forecastId: verdict?.id, extra: { confirmationId: handle.id } });
+      observeAborted('rejected by human confirmation');
+      throw new Error(`BLACK_WALL: action "${actionName}" was REJECTED by human confirmation`);
+    }
+    // pending (incl. timeout / poll error / non-2xx / garbage) — fail closed.
+    emit(cfg.onEvent, { type: 'confirmation_pending', actionName, forecastId: verdict?.id, extra: { confirmationId: handle.id, pollUrl: handle.poll_url } });
+    observeAborted('confirmation pending — not approved within budget');
+    throw new Error(
+      `BLACK_WALL: action "${actionName}" requires human confirmation (pending) — approve at ${handle.poll_url}`
+    );
+  }
+
+  // 3. Legacy STOP.
+  if (isStop(verdict)) {
+    emit(cfg.onEvent, {
+      type: 'stop',
+      actionName,
+      forecastId: verdict?.id,
+      recommendation: verdict?.recommendation,
+    });
+    if (enforce) {
+      observeAborted('blocked by enforce-mode guardrail');
+      const codes = Array.isArray(verdict?.red_flags)
+        ? verdict.red_flags.map((f) => f?.code).filter(Boolean).join(', ')
+        : '';
+      throw makeHardStopError(codes);
+    }
+    return runAndObserve();
+  }
+
+  // 4. GO / CAUTION (no confirmation) — run + observe.
+  return runAndObserve();
+}
+
+/**
  * Per-call gate for MULTI-STEP handlers (the partial-execution fix).
  *
  * A GO on the action as a whole does NOT cover each tool call inside the handler:
@@ -249,32 +565,40 @@ export async function gateCall(action, inputs, run, opts = {}) {
   }
 
   const reportedVia = 'eliza_guardrail';
-  if (cfg.mode === 'enforce' && isStop(verdict)) {
-    emit(cfg.onEvent, { type: 'stop', actionName: action, forecastId: verdict?.id, recommendation: 'STOP' });
-    if (verdict?.id) {
-      observe(verdict.id, { outcome_class: 'aborted', divergence_severity: 'none', details: 'blocked by enforce-mode gateCall' },
-        { apiKey: cfg.apiKey, baseUrl: cfg.baseUrl, reportedVia }).catch(() => {});
-    }
-    const flagCodes = Array.isArray(verdict?.red_flags)
-      ? verdict.red_flags.map((f) => f?.code).filter(Boolean).join(', ')
-      : '';
-    throw new Error(`BLACK_WALL blocked call "${action}": STOP${flagCodes ? ` (${flagCodes})` : ''}`);
-  }
 
-  try {
-    const result = await run();
+  const observeAborted = (details) => {
     if (verdict?.id) {
-      observe(verdict.id, { outcome_class: 'matched' },
+      observe(verdict.id, { outcome_class: 'aborted', divergence_severity: 'none', details },
         { apiKey: cfg.apiKey, baseUrl: cfg.baseUrl, reportedVia }).catch(() => {});
     }
-    return result;
-  } catch (err) {
-    if (verdict?.id) {
-      observe(verdict.id, { outcome_class: 'diverged', divergence_severity: 'medium', details: String(err?.message ?? err).slice(0, 500) },
-        { apiKey: cfg.apiKey, baseUrl: cfg.baseUrl, reportedVia }).catch(() => {});
+  };
+
+  const runAndObserve = async () => {
+    try {
+      const result = await run();
+      if (verdict?.id) {
+        observe(verdict.id, { outcome_class: 'matched' },
+          { apiKey: cfg.apiKey, baseUrl: cfg.baseUrl, reportedVia }).catch(() => {});
+      }
+      return result;
+    } catch (err) {
+      if (verdict?.id) {
+        observe(verdict.id, { outcome_class: 'diverged', divergence_severity: 'medium', details: String(err?.message ?? err).slice(0, 500) },
+          { apiKey: cfg.apiKey, baseUrl: cfg.baseUrl, reportedVia }).catch(() => {});
+      }
+      throw err;
     }
-    throw err;
-  }
+  };
+
+  return handleVerdict({
+    verdict,
+    actionName: action,
+    cfg,
+    runAndObserve,
+    observeAborted,
+    makeHardStopError: (codes) =>
+      new Error(`BLACK_WALL blocked call "${action}": ${verdict?.recommendation ?? 'STOP'}${codes ? ` (${codes})` : ''}`),
+  });
 }
 
 /**
@@ -315,73 +639,67 @@ function wrapActionHandler(action, cfg, logger) {
       return original.call(this, runtime, message, state, opts, callback, responses);
     }
 
-    if (cfg.mode === 'enforce' && isStop(verdict)) {
-      emit(cfg.onEvent, {
-        type: 'stop',
-        actionName: action.name,
-        forecastId: verdict?.id,
-        recommendation: verdict.recommendation,
-      });
-
-      // Best-effort observation that we obeyed the STOP. Don't await — the
-      // throw must hit Eliza's dispatcher promptly.
+    // Best-effort observe(aborted) — don't await; the throw must hit Eliza's
+    // dispatcher promptly. Shared by the hard-stop / legacy-STOP / confirmation
+    // abort paths inside handleVerdict().
+    const observeAborted = (details) => {
       if (verdict?.id) {
         observe(
           verdict.id,
-          { outcome_class: 'aborted', divergence_severity: 'none', details: 'blocked by enforce-mode guardrail' },
+          { outcome_class: 'aborted', divergence_severity: 'none', details },
           { apiKey: cfg.apiKey, baseUrl: cfg.baseUrl, reportedVia: 'eliza_guardrail' }
         ).catch((err) => {
           logger?.warn?.(`[blackwall-guardrail] observe(aborted) failed: ${err?.message ?? err}`);
           emit(cfg.onEvent, { type: 'observe_error', actionName: action.name, forecastId: verdict.id, error: err });
         });
       }
+    };
 
-      const flagCodes = Array.isArray(verdict?.red_flags)
-        ? verdict.red_flags.map((f) => f?.code).filter(Boolean).join(', ')
-        : '';
-      throw new Error(
-        `BLACK_WALL blocked action "${action.name}": ${verdict?.recommendation}${flagCodes ? ` (${flagCodes})` : ''}`
-      );
-    }
-
-    // observe mode (or non-STOP verdict): run the action, observe the outcome.
-    let outcome = 'matched';
-    let observeDetails;
-    let actionError;
     // Run the original handler inside the ALS context carrying THIS action's
     // forecast id, so any gateCall() the handler makes threads to this parent.
-    const callStore = { parentForecastId: verdict?.id, cfg };
-    try {
-      const result = await actionForecastContext.run(callStore, () =>
-        original.call(this, runtime, message, state, opts, callback, responses)
-      );
-      if (verdict?.id) {
-        observe(
-          verdict.id,
-          { outcome_class: outcome },
-          { apiKey: cfg.apiKey, baseUrl: cfg.baseUrl, reportedVia: 'eliza_guardrail' }
-        ).catch((err) => {
-          logger?.warn?.(`[blackwall-guardrail] observe(${outcome}) failed: ${err?.message ?? err}`);
-          emit(cfg.onEvent, { type: 'observe_error', actionName: action.name, forecastId: verdict.id, error: err });
-        });
+    const runAndObserve = async () => {
+      const callStore = { parentForecastId: verdict?.id, cfg };
+      try {
+        const result = await actionForecastContext.run(callStore, () =>
+          original.call(this, runtime, message, state, opts, callback, responses)
+        );
+        if (verdict?.id) {
+          observe(
+            verdict.id,
+            { outcome_class: 'matched' },
+            { apiKey: cfg.apiKey, baseUrl: cfg.baseUrl, reportedVia: 'eliza_guardrail' }
+          ).catch((err) => {
+            logger?.warn?.(`[blackwall-guardrail] observe(matched) failed: ${err?.message ?? err}`);
+            emit(cfg.onEvent, { type: 'observe_error', actionName: action.name, forecastId: verdict.id, error: err });
+          });
+        }
+        return result;
+      } catch (err) {
+        if (verdict?.id) {
+          observe(
+            verdict.id,
+            { outcome_class: 'diverged', divergence_severity: 'medium', details: String(err?.message ?? err).slice(0, 500) },
+            { apiKey: cfg.apiKey, baseUrl: cfg.baseUrl, reportedVia: 'eliza_guardrail' }
+          ).catch((obErr) => {
+            logger?.warn?.(`[blackwall-guardrail] observe(diverged) failed: ${obErr?.message ?? obErr}`);
+            emit(cfg.onEvent, { type: 'observe_error', actionName: action.name, forecastId: verdict.id, error: obErr });
+          });
+        }
+        throw err;
       }
-      return result;
-    } catch (err) {
-      outcome = 'diverged';
-      observeDetails = String(err?.message ?? err).slice(0, 500);
-      actionError = err;
-      if (verdict?.id) {
-        observe(
-          verdict.id,
-          { outcome_class: outcome, divergence_severity: 'medium', details: observeDetails },
-          { apiKey: cfg.apiKey, baseUrl: cfg.baseUrl, reportedVia: 'eliza_guardrail' }
-        ).catch((obErr) => {
-          logger?.warn?.(`[blackwall-guardrail] observe(diverged) failed: ${obErr?.message ?? obErr}`);
-          emit(cfg.onEvent, { type: 'observe_error', actionName: action.name, forecastId: verdict.id, error: obErr });
-        });
-      }
-      throw actionError;
-    }
+    };
+
+    return handleVerdict({
+      verdict,
+      actionName: action.name,
+      cfg,
+      runAndObserve,
+      observeAborted,
+      makeHardStopError: (codes) =>
+        new Error(
+          `BLACK_WALL blocked action "${action.name}": ${verdict?.recommendation}${codes ? ` (${codes})` : ''}`
+        ),
+    });
   };
 
   emit(cfg.onEvent, { type: 'wrapped', actionName: action.name });
