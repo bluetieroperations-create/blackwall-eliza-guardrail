@@ -251,12 +251,36 @@ function hasHardBlocks(verdict) {
 }
 
 /**
- * True when the server offered a human-approval path for this verdict. We key
- * off poll_url specifically — without it there is nothing to poll, so it is not
- * an actionable confirmation handle.
+ * True when the server signalled a human-confirmation REQUIREMENT for this
+ * verdict. We key off the PRESENCE of the confirmation object (or its id) — NOT
+ * off poll_url.
+ *
+ * This is the fail-CLOSED detection (audit fix): a malformed/partial server
+ * response that carries a `confirmation` object but a missing/empty `poll_url`
+ * still REQUIRES confirmation. Keying off poll_url here let such a verdict fall
+ * through to the GO/CAUTION path and RUN ungated in enforce mode — defeating the
+ * gate. By detecting on presence, the confirmation branch always owns the
+ * decision, and it (not this predicate) decides fail-closed when there is
+ * nothing pollable.
  */
 function hasConfirmationHandle(verdict) {
-  return Boolean(verdict?.confirmation && verdict.confirmation.poll_url);
+  const c = verdict?.confirmation;
+  if (!c || typeof c !== 'object') return false;
+  // An object (even {}) or one with an id is a confirmation requirement.
+  return true;
+}
+
+/**
+ * True when the confirmation handle carries a usable, SAME-ORIGIN poll_url we
+ * can actually authenticate against. A missing/empty/non-string poll_url, or an
+ * off-origin one (we never send the bearer off-origin, so it can never approve),
+ * is NOT pollable — in enforce mode that must fail closed, never run ungated.
+ */
+function hasPollableUrl(verdict, cfg) {
+  const pollUrl = verdict?.confirmation?.poll_url;
+  if (typeof pollUrl !== 'string' || pollUrl.trim() === '') return false;
+  // Off-origin ⇒ unauthable ⇒ can never return approved ⇒ not usefully pollable.
+  return pollAllowsAuth(pollUrl, cfg.baseUrl);
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -421,6 +445,24 @@ async function handleVerdict({ verdict, actionName, cfg, runAndObserve, observeA
     // observe mode: NEVER block — observe's contract is to never alter behavior.
     if (!enforce) {
       return runAndObserve();
+    }
+
+    // enforce mode: a confirmation is REQUIRED. If there is no pollable,
+    // same-origin poll_url (missing / empty / non-string, or off-origin so we
+    // can never authenticate the poll), there is no way to obtain an explicit
+    // `approved` — so FAIL CLOSED. Running here would be the ungated-run gap the
+    // audit found (confirmation present but no usable handle ⇒ action ran).
+    if (!hasPollableUrl(verdict, cfg)) {
+      emit(cfg.onEvent, {
+        type: 'confirmation_pending',
+        actionName,
+        forecastId: verdict?.id,
+        extra: { confirmationId: handle?.id, pollUrl: handle?.poll_url, reason: 'no-pollable-url' },
+      });
+      observeAborted('confirmation required but no pollable approval URL');
+      throw new Error(
+        `BLACK_WALL: action "${actionName}" requires human confirmation but no pollable approval URL was provided`
+      );
     }
 
     // enforce mode: poll for an explicit approval. Fail closed otherwise.

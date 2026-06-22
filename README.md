@@ -54,9 +54,10 @@ Before v0.3.0 the plugin ignored the handle: in enforce it just ran (CAUTION ≠
 How a confirmation verdict is handled, in precedence order (strictest-wins):
 
 1. **`hard_blocks` present** → treated as a hard STOP. Enforce throws; observe runs. The confirmation path is **not** entered.
-2. **confirmation handle present** (`confirmation.poll_url`):
+2. **confirmation requirement present** (a `confirmation` object on the verdict — detected by **presence**, not by `poll_url`):
    - **observe mode** → the action **still runs** (observe never alters behavior). The plugin emits a `confirmation_required` event and calls your `onConfirmationRequired` callback so you have visibility.
-   - **enforce mode** → the plugin **polls** `poll_url` (`GET`, `Authorization: Bearer <apiKey>`) every `confirmationPollMs` up to a total `confirmationWaitMs` budget:
+   - **enforce mode, no pollable `poll_url`** (missing / empty / non-string, or an **off-origin** URL we can never authenticate against) → there is no way to obtain an explicit approval, so the action **fails closed and aborts** (throws `… requires human confirmation but no pollable approval URL was provided`). A malformed/partial server response can never silently run the action ungated.
+   - **enforce mode, usable same-origin `poll_url`** → the plugin **polls** `poll_url` (`GET`, `Authorization: Bearer <apiKey>`) every `confirmationPollMs` up to a total `confirmationWaitMs` budget:
      - poll returns `status: "approved"` → action **runs**.
      - poll returns `status: "rejected"` → action **aborts** (throws `… was REJECTED by human confirmation`).
      - still pending when the budget elapses, **or any poll error / non-2xx / unparseable body / network failure** → action **aborts** (throws `… requires human confirmation (pending) — approve at <poll_url>`).
@@ -190,7 +191,7 @@ Nothing custodial — no funds, keys, or private data leave your side. ~10 minut
 - **Confirmation-aware enforcement.** The plugin now honors the verdict's `hard_blocks` and `confirmation` handle, not just `recommendation === 'STOP'`. In enforce mode a confirmation verdict is routed to a human-approval poll instead of being silently run (CAUTION) or hard-aborted. See [the confirmation flow](#human-in-the-loop-the-confirmation-flow-v030).
 - New optional config (all env-backed, backward-compatible): `confirmationWaitMs` (default **0** = abort-and-surface), `confirmationPollMs` (default 2000, floor 250), `onConfirmationRequired` callback.
 - New telemetry events: `confirmation_required`, `confirmation_approved`, `confirmation_rejected`, `confirmation_pending`.
-- **Fail-closed safety invariant:** in enforce mode an action carrying a confirmation handle never runs unless a poll explicitly returns `status: 'approved'`. Timeout, rejection, poll error, non-2xx, or garbage body all abort. No safety regression vs 0.2.x; pure default-additive behavior change is gated behind enforce mode + a present confirmation handle, which the server only began returning alongside this release.
+- **Fail-closed safety invariant:** in enforce mode an action carrying a confirmation requirement never runs unless a same-origin poll explicitly returns `status: 'approved'`. Timeout, rejection, poll error, non-2xx, garbage body, **and a missing/empty/off-origin (non-pollable) `poll_url`** all abort. The requirement is detected by the **presence** of the `confirmation` object (not by `poll_url`), so a malformed/partial server response cannot make a confirmation-bearing action run ungated. No safety regression vs 0.2.x; pure default-additive behavior change is gated behind enforce mode + a present confirmation requirement, which the server only began returning alongside this release.
 - Shared verdict-handling path now used by both the action-handler wrap and `gateCall()`.
 
 ## License
