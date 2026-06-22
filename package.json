@@ -1,6 +1,6 @@
 {
   "name": "blackwall-eliza-guardrail",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "BLACK_WALL pre-action guardrail for ElizaOS agents. Wraps every action handler with a forecast() check so STOP-rated actions abort before they run; gateCall() adds per-call gating for multi-step handlers.",
   "type": "module",
   "main": "./src/index.mjs",
@@ -21,7 +21,7 @@
   ],
   "scripts": {
     "check": "node --check src/index.mjs",
-    "test": "node smoke-test.mjs",
+    "test": "node smoke-test.mjs && node test-confirmation.mjs",
     "prepare": "git config core.hooksPath .githooks",
     "secrets:scan": "gitleaks git --no-banner --config .gitleaks.toml"
   },

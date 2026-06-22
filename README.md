@@ -35,9 +35,53 @@ That's it. Every action your agent invokes is now scored by BLACK_WALL before it
 | Mode | Behavior |
 |---|---|
 | `observe` (default) | Score every action and log to BLACK_WALL; never abort. Zero behavior change — safe to drop in. |
-| `enforce` | Score every action; **throw on STOP** verdicts. Eliza catches the throw and converts it to a failureResult. |
+| `enforce` | Score every action; **abort STOP / hard-block / unapproved-confirmation** verdicts. Eliza catches the throw and converts it to a failureResult. |
 
 Start in `observe` for a few days to see what the verdicts look like on your traffic. Switch to `enforce` once you trust the scoring.
+
+## Human-in-the-loop: the confirmation flow (v0.3.0)
+
+A risky-but-not-forbidden action (e.g. a large `send_money`) often comes back from BLACK_WALL not as a flat `STOP` but as a verdict that carries a **confirmation handle** — the server has opened a human-approval request and handed you a `poll_url`:
+
+```jsonc
+{ "recommendation": "CAUTION", "gate": "CONFIRM",
+  "confirmation": { "id": "conf_…", "status": "pending", "poll_url": "https://…" },
+  "hard_blocks": [] }
+```
+
+Before v0.3.0 the plugin ignored the handle: in enforce it just ran (CAUTION ≠ STOP), and there was no way to route the action to a human. v0.3.0 makes the plugin **confirmation-aware**.
+
+How a confirmation verdict is handled, in precedence order (strictest-wins):
+
+1. **`hard_blocks` present** → treated as a hard STOP. Enforce throws; observe runs. The confirmation path is **not** entered.
+2. **confirmation handle present** (`confirmation.poll_url`):
+   - **observe mode** → the action **still runs** (observe never alters behavior). The plugin emits a `confirmation_required` event and calls your `onConfirmationRequired` callback so you have visibility.
+   - **enforce mode** → the plugin **polls** `poll_url` (`GET`, `Authorization: Bearer <apiKey>`) every `confirmationPollMs` up to a total `confirmationWaitMs` budget:
+     - poll returns `status: "approved"` → action **runs**.
+     - poll returns `status: "rejected"` → action **aborts** (throws `… was REJECTED by human confirmation`).
+     - still pending when the budget elapses, **or any poll error / non-2xx / unparseable body / network failure** → action **aborts** (throws `… requires human confirmation (pending) — approve at <poll_url>`).
+3. **legacy `STOP`** (no confirmation) → unchanged: enforce throws, observe runs.
+4. **GO / CAUTION** (no confirmation) → unchanged: runs.
+
+### `confirmationWaitMs` defaults to `0` — abort and surface
+
+**The default (`confirmationWaitMs: 0`) means: check once, do not wait. A still-pending confirmation aborts immediately**, and the thrown error carries the `poll_url` so your operator can approve out of band. This is the safe default — your agent never silently blocks for minutes, and there is **zero safety regression vs v0.2.x**: in enforce mode an action with a confirmation handle **never runs unless a poll explicitly returned `approved`**.
+
+Set `confirmationWaitMs` to a positive value (e.g. `30000`) only if you want the handler to block in-process waiting for a fast human approval.
+
+```ts
+blackwallGuardrail({
+  mode: 'enforce',
+  confirmationWaitMs: 0,        // default — abort-and-surface; raise to wait in-process
+  confirmationPollMs: 2000,     // poll interval (floor 250ms)
+  onConfirmationRequired: (handle, { actionName }) => {
+    // fired in BOTH modes — route a human-approval prompt anywhere you like
+    notifyOperator(`approve "${actionName}": ${handle.poll_url}`);
+  },
+});
+```
+
+Failure is **closed**: an unverifiable approval (timeout, network error, garbage body) is treated as *not approved*. The action does not run.
 
 ## Why list it LAST
 
@@ -56,12 +100,17 @@ blackwallGuardrail({
   maxInputBytes: 8 * 1024,                // hard cap on the forecast payload size
   sendUserIntent: false,                  // do NOT send the user's message text (see Data & privacy)
   onEvent: (event) => myTelemetry(event), // optional telemetry hook
+
+  // Human-in-the-loop confirmation flow (v0.3.0):
+  confirmationWaitMs: 0,                   // enforce-mode wait budget; 0 = abort-and-surface (default). Env BLACKWALL_CONFIRMATION_WAIT_MS
+  confirmationPollMs: 2000,                // poll interval, floor 250ms. Env BLACKWALL_CONFIRMATION_POLL_MS
+  onConfirmationRequired: (handle, meta) => routeApproval(handle, meta), // optional, fires in both modes
 });
 ```
 
 ### Telemetry events
 
-`onEvent` fires for: `init`, `wrapped`, `skipped`, `forecast_error`, `stop`, `observe_error`. Useful for piping guardrail decisions into your own observability stack.
+`onEvent` fires for: `init`, `wrapped`, `skipped`, `forecast_error`, `stop`, `observe_error`, and the confirmation events `confirmation_required`, `confirmation_approved`, `confirmation_rejected`, `confirmation_pending`. Useful for piping guardrail decisions into your own observability stack.
 
 ## How it works
 
@@ -133,6 +182,16 @@ Building an ElizaOS agent that takes **real irreversible actions** (on-chain tra
 Nothing custodial — no funds, keys, or private data leave your side. ~10 minutes a week.
 
 **→ Apply as a design partner** (2-min form): https://docs.google.com/forms/d/e/1FAIpQLScw4TxRhMn-qrg91jDyvP0U2-yzcEmKxdwqINbNhoka4hUkXA/viewform — or [open an issue](https://github.com/bluetieroperations-create/blackwall-eliza-guardrail/issues/new).
+
+## Changelog
+
+### 0.3.0
+
+- **Confirmation-aware enforcement.** The plugin now honors the verdict's `hard_blocks` and `confirmation` handle, not just `recommendation === 'STOP'`. In enforce mode a confirmation verdict is routed to a human-approval poll instead of being silently run (CAUTION) or hard-aborted. See [the confirmation flow](#human-in-the-loop-the-confirmation-flow-v030).
+- New optional config (all env-backed, backward-compatible): `confirmationWaitMs` (default **0** = abort-and-surface), `confirmationPollMs` (default 2000, floor 250), `onConfirmationRequired` callback.
+- New telemetry events: `confirmation_required`, `confirmation_approved`, `confirmation_rejected`, `confirmation_pending`.
+- **Fail-closed safety invariant:** in enforce mode an action carrying a confirmation handle never runs unless a poll explicitly returns `status: 'approved'`. Timeout, rejection, poll error, non-2xx, or garbage body all abort. No safety regression vs 0.2.x; pure default-additive behavior change is gated behind enforce mode + a present confirmation handle, which the server only began returning alongside this release.
+- Shared verdict-handling path now used by both the action-handler wrap and `gateCall()`.
 
 ## License
 
