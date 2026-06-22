@@ -473,6 +473,66 @@ await runTest('[9] enforce + failClosed:true + 2xx verdict-LESS body → forecas
 });
 
 // ===========================================================================
+// [10] Off-contract STRING config does NOT silently invert (audit L-1 hardening).
+//   failClosed:'false' must mean NONE (not truthy-coerce to ALL).
+//   failClosed:'true' means ALL; failClosed:'PAY_X,PAY_Y' is a list.
+//   This mirrors env semantics so a "stringified boolean" typo can't flip a
+//   high-stakes config to the opposite of what the operator wrote.
+// MUTATION: the pre-hardening `failClosed ? ALWAYS : NEVER` made 'false' truthy
+// → ALL → PAY_FREE would abort → the "ran" assertion below fails.
+// ===========================================================================
+await runTest("[10] off-contract string failClosed:'false' → NONE (does not invert to fail-closed)", async () => {
+  // 10a — string 'false' → fail OPEN (runs).
+  reset();
+  let ran = false;
+  const a = makeAction('PAY_FREE', async () => { ran = true; return 'X'; });
+  const rt = makeRuntime([a]);
+  const p = blackwallGuardrail({ apiKey: 'bw_k', mode: 'enforce', failClosed: 'false' });
+  await p.init(rt);
+  forecastResponses.push({ throw: OUTAGE() });
+  const result = await a.handler(rt, { content: { text: 'x' } }, {}, {});
+  assert(ran === true, "string 'false': handler RAN (treated as NONE, not truthy-coerced to ALL)");
+  assert(result === 'X', "string 'false': returned result");
+
+  // 10b — string 'true' → fail CLOSED for all.
+  reset();
+  let ran2 = false;
+  const a2 = makeAction('PAY_X', async () => { ran2 = true; return 'X'; });
+  const rt2 = makeRuntime([a2]);
+  const p2 = blackwallGuardrail({ apiKey: 'bw_k', mode: 'enforce', failClosed: 'true' });
+  await p2.init(rt2);
+  forecastResponses.push({ throw: OUTAGE() });
+  let threw2 = null;
+  try { await a2.handler(rt2, { content: { text: 'x' } }, {}, {}); } catch (e) { threw2 = e; }
+  assert(ran2 === false, "string 'true': handler did NOT run (fail closed for all)");
+  assert(threw2 !== null && /failing closed/i.test(threw2?.message), "string 'true': threw fail-closed");
+
+  // 10c — comma-list string → only listed names fail closed.
+  reset();
+  let ranListed = false;
+  const aL = makeAction('PAY_A', async () => { ranListed = true; return 'A'; });
+  const rtL = makeRuntime([aL]);
+  const pL = blackwallGuardrail({ apiKey: 'bw_k', mode: 'enforce', failClosed: 'PAY_A,PAY_B' });
+  await pL.init(rtL);
+  forecastResponses.push({ throw: OUTAGE() });
+  let threwL = null;
+  try { await aL.handler(rtL, { content: { text: 'x' } }, {}, {}); } catch (e) { threwL = e; }
+  assert(ranListed === false, 'list string: PAY_A (listed) did NOT run');
+  assert(threwL !== null && /failing closed/i.test(threwL?.message), 'list string: PAY_A threw fail-closed');
+
+  reset();
+  let ranUnlisted = false;
+  const aU = makeAction('PAY_C', async () => { ranUnlisted = true; return 'C'; });
+  const rtU = makeRuntime([aU]);
+  const pU = blackwallGuardrail({ apiKey: 'bw_k', mode: 'enforce', failClosed: 'PAY_A,PAY_B' });
+  await pU.init(rtU);
+  forecastResponses.push({ throw: OUTAGE() });
+  const resU = await aU.handler(rtU, { content: { text: 'x' } }, {}, {});
+  assert(ranUnlisted === true, 'list string: PAY_C (unlisted) RAN (fail-open)');
+  assert(resU === 'C', 'list string: PAY_C returned result');
+});
+
+// ===========================================================================
 console.log(`\n${failed === 0 ? 'All ' : ''}fail-closed tests done — ${passed} passed, ${failed} failed.`);
 if (failedTests.length > 0) {
   console.error(`FAILED BLOCKS (${failedTests.length}): ${failedTests.join(', ')}`);

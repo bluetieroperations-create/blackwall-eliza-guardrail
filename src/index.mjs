@@ -66,7 +66,7 @@ function clampWaitMs(n) {
  * @property {number} [confirmationPollMs] Interval (ms) between confirmation polls. Floor 250. Default 2000. Env BLACKWALL_CONFIRMATION_POLL_MS.
  * @property {(handle: object, meta: { actionName: string, verdict: object }) => void} [onConfirmationRequired] Best-effort callback fired (both modes) when the gate returns a confirmation handle — your hook to route a human-approval prompt out of band. Errors are swallowed.
  * @property {typeof fetch} [fetchImpl] Inject a fetch implementation for the confirmation poll (tests / proxy). Defaults to globalThis.fetch.
- * @property {boolean | string[] | ((actionName: string) => boolean)} [failClosed] Opt-in fail-closed on gate OUTAGE (forecast() throws). DEFAULT false = fail-open (run ungated; backward-compat). true = fail closed for ALL actions; string[] = fail closed only for listed action names; predicate = fail closed when it returns true. Enforce mode only; observe is never affected. Env fallback BLACKWALL_FAIL_CLOSED ('true'/'false' or comma-separated list); config wins over env.
+ * @property {boolean | string | string[] | ((actionName: string) => boolean)} [failClosed] Opt-in fail-closed on gate OUTAGE (forecast() throws). DEFAULT false = fail-open (run ungated; backward-compat). true = fail closed for ALL actions; string[] = fail closed only for listed action names; predicate = fail closed when it returns true. A string is parsed like the env var ('true'/'false' or comma-separated list). Enforce mode only; observe is never affected. Env fallback BLACKWALL_FAIL_CLOSED; config wins over env.
  */
 
 /**
@@ -152,17 +152,39 @@ function resolveConfig(config = {}) {
  *   - string[]                   → fail closed ONLY for listed action names
  *   - (actionName) => boolean    → predicate
  *
+ * A STRING config value is parsed with the SAME semantics as the env var, so a
+ * "stringified boolean" typo (`failClosed: 'false'`) means NONE — it can never
+ * silently invert to fail-closed-for-all the way a blind truthy-coercion would
+ * (audit L-1 hardening: this is a high-stakes control, so a malformed value must
+ * not flip its meaning).
+ *
  * Env BLACKWALL_FAIL_CLOSED (only consulted when config.failClosed is undefined):
  *   - 'true' / 'false'           → all / none
  *   - 'PAY_A,PAY_B'              → comma-separated action list
  *
- * @param {boolean | string[] | ((actionName: string) => boolean) | undefined} failClosed
+ * @param {boolean | string | string[] | ((actionName: string) => boolean) | undefined} failClosed
  * @returns {(actionName: string) => boolean}
  */
-function resolveFailClosed(failClosed) {
-  const NEVER = () => false;
-  const ALWAYS = () => true;
+const FAIL_CLOSED_NEVER = () => false;
+const FAIL_CLOSED_ALWAYS = () => true;
 
+/**
+ * Parse a string fail-closed spec ('true' / 'false' / comma-list) to a predicate.
+ * Shared by the string-config and env paths so both behave identically.
+ */
+function parseFailClosedString(raw) {
+  const trimmed = String(raw).trim();
+  if (trimmed === '') return FAIL_CLOSED_NEVER;
+  const lower = trimmed.toLowerCase();
+  if (lower === 'true') return FAIL_CLOSED_ALWAYS;
+  if (lower === 'false') return FAIL_CLOSED_NEVER;
+  const set = new Set(
+    trimmed.split(',').map((s) => s.trim()).filter((s) => s !== '')
+  );
+  return (actionName) => set.has(actionName);
+}
+
+function resolveFailClosed(failClosed) {
   // Build a predicate from a config value (config wins over env).
   if (failClosed !== undefined) {
     if (typeof failClosed === 'function') {
@@ -180,23 +202,23 @@ function resolveFailClosed(failClosed) {
       const set = new Set(failClosed.filter((n) => typeof n === 'string'));
       return (actionName) => set.has(actionName);
     }
-    // Any other value (true/false/truthy/falsy) collapses to all/none.
-    return failClosed ? ALWAYS : NEVER;
+    if (typeof failClosed === 'boolean') {
+      return failClosed ? FAIL_CLOSED_ALWAYS : FAIL_CLOSED_NEVER;
+    }
+    // A STRING config is parsed like the env var (so 'false' means NONE, not a
+    // truthy-coerce to ALL). Any OTHER off-contract type (number, object, etc.)
+    // is treated as the safe default (fail-OPEN / NEVER) rather than blindly
+    // truthy-coerced — a malformed high-stakes config must not silently invert.
+    if (typeof failClosed === 'string') {
+      return parseFailClosedString(failClosed);
+    }
+    return FAIL_CLOSED_NEVER;
   }
 
   // Env fallback — only when config did not specify failClosed at all.
   const env = process.env.BLACKWALL_FAIL_CLOSED;
-  if (env === undefined) return NEVER;
-  const trimmed = String(env).trim();
-  if (trimmed === '') return NEVER;
-  const lower = trimmed.toLowerCase();
-  if (lower === 'true') return ALWAYS;
-  if (lower === 'false') return NEVER;
-  // Comma-separated action list.
-  const set = new Set(
-    trimmed.split(',').map((s) => s.trim()).filter((s) => s !== '')
-  );
-  return (actionName) => set.has(actionName);
+  if (env === undefined) return FAIL_CLOSED_NEVER;
+  return parseFailClosedString(env);
 }
 
 /**

@@ -100,7 +100,7 @@ When `forecast()` **throws** — BLACK_WALL is down, the network times out, or t
 | `string[]` | Fail closed **only** for actions whose name is in the list. |
 | `(actionName) => boolean` | Fail closed when the predicate returns `true`. |
 
-Env fallback **`BLACKWALL_FAIL_CLOSED`**: `'true'` / `'false'`, or a comma-separated action list (`PAY_NEW_PAYEE,TRANSFER`). A `failClosed` config value **always wins over** the env var.
+Env fallback **`BLACKWALL_FAIL_CLOSED`**: `'true'` / `'false'`, or a comma-separated action list (`PAY_NEW_PAYEE,TRANSFER`). A `failClosed` config value **always wins over** the env var. A **string** config value is parsed with the same rules as the env var (so `failClosed: 'false'` means *none* — it never silently inverts to fail-closed-for-all); any other off-contract type falls back to the safe default (fail-open).
 
 ```ts
 blackwallGuardrail({
