@@ -368,4 +368,46 @@ console.log('\n[14] maxInputBytes — a wide object of LONG KEY NAMES cannot def
   assert(maxSampleLen <= 65, `each sample key name is length-bounded (longest ${maxSampleLen} <= 65)`);
 }
 
+// -----------------------------------------------------------------------
+console.log('\n[decision] gated decision surfaces the verifiable receipt; none when absent');
+{
+  await reset();
+  const action = makeAction('wire_funds', async () => ({ ok: true }));
+  const runtime = makeRuntime([action]);
+  const plugin = blackwallGuardrail({ apiKey: 'bw_test_key', mode: 'observe', onEvent: (e) => events.push(e) });
+  await plugin.init(runtime);
+
+  // Real ReceiptEnvelope shape (blackwalltier.com): hashes + signature only, no PII.
+  const receipt = {
+    id: 'rcpt_1', forecast_id: 'fc_rcpt', issued_at: '2026-07-07T00:00:00Z',
+    algorithm: 'ed25519', key_id: 'k1',
+    request_hash: 'sha256:aa', response_hash: 'sha256:bb',
+    signature: 'base64url-sig', verify_url: 'https://blackwalltier.com/api/v1/receipts/verify',
+  };
+  nextResponses.push({ body: { id: 'fc_rcpt', recommendation: 'GO', risk_score: 5, red_flags: [], receipt } });
+  nextResponses.push({ body: { ok: true } }); // observe
+
+  await action.handler(runtime, { content: { text: 'pay vendor' } }, {}, { parameters: { to: '0xabc' } });
+  await new Promise((r) => setTimeout(r, 10));
+
+  const decision = events.find((e) => e.type === 'decision');
+  assert(decision != null, 'decision event emitted for a gated decision');
+  assert(decision.forecastId === 'fc_rcpt', 'decision event carries the forecast id');
+  assert(decision.recommendation === 'GO', 'decision event carries the recommendation');
+  assert(decision.receipt === receipt, 'decision event surfaces the verifiable receipt envelope');
+}
+{
+  // Regression: a verdict WITHOUT a receipt must NOT emit a phantom decision event.
+  await reset();
+  const action = makeAction('noop', async () => ({ ok: true }));
+  const runtime = makeRuntime([action]);
+  const plugin = blackwallGuardrail({ apiKey: 'bw_test_key', mode: 'observe', onEvent: (e) => events.push(e) });
+  await plugin.init(runtime);
+  nextResponses.push({ body: { id: 'fc_norcpt', recommendation: 'GO', risk_score: 5, red_flags: [] } });
+  nextResponses.push({ body: { ok: true } });
+  await action.handler(runtime, { content: { text: 'x' } }, {}, {});
+  await new Promise((r) => setTimeout(r, 10));
+  assert(!events.some((e) => e.type === 'decision'), 'no decision event when the gate returned no receipt');
+}
+
 console.log('\nAll smoke tests passed.\n');

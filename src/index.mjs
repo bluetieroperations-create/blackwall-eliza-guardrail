@@ -61,7 +61,7 @@ function clampWaitMs(n) {
  * @property {(actionName: string) => boolean} [shouldGate] Per-action opt-out. Return false to skip wrapping.
  * @property {number} [maxInputBytes] Hard cap on the forecast() inputs payload size. Default 8KB.
  * @property {boolean} [sendUserIntent] Send the raw inbound user message as context.user_intent. Default true; set false (or BLACKWALL_SEND_USER_INTENT=false) to keep user message text on-box.
- * @property {(event: GuardrailEvent) => void} [onEvent] Telemetry hook (logged on STOP, error, observe failure, confirmation events, etc.).
+ * @property {(event: GuardrailEvent) => void} [onEvent] Telemetry hook. Fires a `decision` event (carrying the verifiable `receipt`) once per gated decision in BOTH modes, plus STOP, error, observe-failure, and confirmation events.
  * @property {number} [confirmationWaitMs] Enforce-mode total wall-clock budget (ms) to wait for a human-approval confirmation. Default 0 ⇒ check once, abort-and-surface if still pending. Env BLACKWALL_CONFIRMATION_WAIT_MS.
  * @property {number} [confirmationPollMs] Interval (ms) between confirmation polls. Floor 250. Default 2000. Env BLACKWALL_CONFIRMATION_POLL_MS.
  * @property {(handle: object, meta: { actionName: string, verdict: object }) => void} [onConfirmationRequired] Best-effort callback fired (both modes) when the gate returns a confirmation handle — your hook to route a human-approval prompt out of band. Errors are swallowed.
@@ -71,10 +71,11 @@ function clampWaitMs(n) {
 
 /**
  * @typedef {Object} GuardrailEvent
- * @property {'wrapped'|'forecast_error'|'fail_closed'|'stop'|'observe_error'|'skipped'|'init'|'confirmation_required'|'confirmation_approved'|'confirmation_rejected'|'confirmation_pending'} type
+ * @property {'decision'|'wrapped'|'forecast_error'|'fail_closed'|'stop'|'observe_error'|'skipped'|'init'|'confirmation_required'|'confirmation_approved'|'confirmation_rejected'|'confirmation_pending'} type
  * @property {string} [actionName]
  * @property {string} [forecastId]
  * @property {string} [recommendation]
+ * @property {object} [receipt] Verifiable decision-receipt envelope from the gate (present on `decision` events). Ed25519-signed + transparency-anchored by the issuer; verify it independently via the published signing keys — no need to trust this plugin.
  * @property {unknown} [error]
  * @property {Record<string, any>} [extra]
  */
@@ -546,6 +547,24 @@ async function pollConfirmation(verdict, cfg) {
  */
 async function handleVerdict({ verdict, actionName, cfg, runAndObserve, observeAborted, makeHardStopError }) {
   const enforce = cfg.mode === 'enforce';
+
+  // 0. Surface the VERIFIABLE decision receipt for every gated decision (both
+  //    modes), exactly once, before any enforce/confirmation branching. The
+  //    BLACK_WALL backend signs each verdict (Ed25519) and anchors it in a
+  //    transparency log; passing `verdict.receipt` through here is what lets the
+  //    agent RETAIN an independently verifiable audit trail — verify it against
+  //    the issuer's published keys (/.well-known/blackwall-signing-keys.json)
+  //    and verify endpoint, no need to trust this plugin or re-call the gate.
+  //    Best-effort: emitted only when the gate returned a receipt.
+  if (verdict?.receipt != null) {
+    emit(cfg.onEvent, {
+      type: 'decision',
+      actionName,
+      forecastId: verdict?.id,
+      recommendation: verdict?.recommendation,
+      receipt: verdict.receipt,
+    });
+  }
 
   // 1. Hard stop wins — never enter the confirmation flow.
   if (hasHardBlocks(verdict)) {

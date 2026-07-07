@@ -148,7 +148,31 @@ blackwallGuardrail({
 
 ### Telemetry events
 
-`onEvent` fires for: `init`, `wrapped`, `skipped`, `forecast_error`, `fail_closed`, `stop`, `observe_error`, and the confirmation events `confirmation_required`, `confirmation_approved`, `confirmation_rejected`, `confirmation_pending`. Useful for piping guardrail decisions into your own observability stack. (`forecast_error` fires when a gate outage is handled fail-open; `fail_closed` fires when it is handled fail-closed — see [fail-closed](#gate-outage-fail-open-default-vs-fail-closed-opt-in).)
+`onEvent` fires for: `decision`, `init`, `wrapped`, `skipped`, `forecast_error`, `fail_closed`, `stop`, `observe_error`, and the confirmation events `confirmation_required`, `confirmation_approved`, `confirmation_rejected`, `confirmation_pending`. Useful for piping guardrail decisions into your own observability stack. (`forecast_error` fires when a gate outage is handled fail-open; `fail_closed` fires when it is handled fail-closed — see [fail-closed](#gate-outage-fail-open-default-vs-fail-closed-opt-in).)
+
+### Verifiable decision receipts (`decision` event)
+
+A `decision` event fires **once per gated decision, in both modes**, carrying a
+`receipt` — the gate's **independently verifiable** record of what it decided.
+BLACK_WALL signs every verdict with Ed25519 and anchors it in a transparency log,
+so you can prove what the gate told you **without trusting this plugin or
+re-calling the API**:
+
+- Fetch the issuer's public keys: [`https://blackwalltier.com/.well-known/blackwall-signing-keys.json`](https://blackwalltier.com/.well-known/blackwall-signing-keys.json) (rotating; `active_key_id` + retired keys for grace-period verification).
+- Verify a receipt yourself with any Ed25519 (RFC 8032) library, or via the hosted verify endpoint `https://blackwalltier.com/api/v1/receipts/verify`.
+- Check transparency-log inclusion at `https://blackwalltier.com/api/v1/receipts/:id/inclusion` (receipts are batched and anchored on-chain).
+
+Capture them straight off the event:
+
+```js
+blackwallGuardrail({
+  onEvent: (e) => { if (e.type === 'decision') myAuditStore.append(e.receipt); },
+});
+```
+
+The receipt is a neutral, portable proof of every allow/stop your agent made —
+the audit trail regulated or high-stakes agents need, that you can hand to a
+third party and they can check for themselves.
 
 ## How it works
 
@@ -222,6 +246,11 @@ Nothing custodial — no funds, keys, or private data leave your side. ~10 minut
 **→ Apply as a design partner** (2-min form): https://docs.google.com/forms/d/e/1FAIpQLScw4TxRhMn-qrg91jDyvP0U2-yzcEmKxdwqINbNhoka4hUkXA/viewform — or [open an issue](https://github.com/bluetieroperations-create/blackwall-eliza-guardrail/issues/new).
 
 ## Changelog
+
+### 0.5.0
+
+- **Verifiable decision receipts surfaced.** New telemetry event `decision`, fired **once per gated decision in both modes**, carries the gate's `receipt` — the Ed25519-signed, transparency-anchored record of what BLACK_WALL decided. Capture it off `onEvent` to keep an **independently verifiable** audit trail you can hand to a third party (verify against the issuer's [published signing keys](https://blackwalltier.com/.well-known/blackwall-signing-keys.json) / verify endpoint / inclusion proof — no need to trust this plugin). See [Verifiable decision receipts](#verifiable-decision-receipts-decision-event).
+- Backward-compatible: purely additive. No `decision` event is emitted when the gate returns no receipt (no phantom events); all existing events and behavior are unchanged.
 
 ### 0.4.0
 
